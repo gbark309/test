@@ -1,363 +1,216 @@
 <#
 .SYNOPSIS
-    Applies a standard configuration baseline across all IIS sites on this
-    server: Windows Authentication (Kerberos-only), dual log targets, a
-    default document, the Management Service, ASP session timeout, and
-    Failed Request Tracing rules.
+    Reverts changes made by Configure-IIS-Sites.ps1: restores
+    applicationHost.config from its pre-change backup, and restores the
+    WMSVC/HTTP.sys registry values and WMSVC service state to what they were
+    before that script ran.
 
 .DESCRIPTION
-    For EVERY site returned by Get-Website, this script:
+    Configure-IIS-Sites.ps1 saves two files per run under -BackupFolder:
+        applicationHost.config.bak_<timestamp>   - full config backup
+        Configure-IIS-Sites_state_<timestamp>.json - registry/service snapshot
 
-    1. Authentication
-       - Enables Windows Authentication
-       - Sets providers to ONLY "Negotiate:Kerberos" (removes Negotiate/NTLM
-         fallback - Kerberos-only, no NTLM negotiation)
-       - Disables useKernelMode (required when using Negotiate:Kerberos-only -
-         see Microsoft guidance: kernel-mode auth must be off for this provider)
-       - Disables Anonymous, Basic, and Digest authentication
-         (Basic/Digest sections may not exist since those role services were
-         never installed - handled gracefully if so)
+    This script uses that pair to fully roll back:
+        1. Stops IIS (so applicationHost.config can be safely replaced)
+        2. Restores applicationHost.config from the backup - this alone
+           reverts every site/server-level IIS config change (authentication,
+           logging, default document, ASP session timeout, FRT rules,
+           siteDefaults)
+        3. Restores WMSVC and HTTP.sys registry values to their prior state -
+           if a value didn't exist before, it's removed rather than merely
+           reset to something else. If an entire key didn't exist before
+           (e.g. WebManagement\Server), the whole key is removed.
+        4. Restores the WMSVC service's StartType and running/stopped state
+        5. Restarts IIS
 
-    2. Logging
-       - logFile.logTargetW3C = "File,ETW" (Log Event Destination: Both Log
-         File and ETW Event), set at siteDefaults and per-site
+.PARAMETER Timestamp
+    Which run to revert (format: yyyyMMdd_HHmmss). If omitted, the most
+    recent state file under -BackupFolder is used automatically.
 
-    3. Default Document
-       - Ensures "portal.htm" exists in the default document list and moves
-         it to the TOP of the list (first document IIS will look for),
-         applied at the server default and per-site
+.PARAMETER BackupFolder
+    Where Configure-IIS-Sites.ps1 saved its backups. Default: C:\Config-Backups
 
-    4. Management Service (WMSVC)
-       - Enables remote management (registry)
-       - Redirects its logging to E:\Logs\WMSVC
-       - Sets the service to Automatic startup and starts it
-
-    5b. HTTP.sys parameters
-       - HKLM\SYSTEM\CurrentControlSet\Services\HTTP\Parameters
-         MaxFieldLength  = 0xfffe (DWORD)
-         MaxRequestBytes = 0xfffe (DWORD)
-       - NOTE: HTTP.sys is a kernel-mode driver; these only take effect after
-         a full server restart, not just an IIS or service restart.
-
-    5. ASP Session Properties
-       - Classic ASP session timeout set to 15 minutes (system.webServer/asp/session)
-
-    6. Failed Request Tracing Rules
-       - Adds an "All content (*)" rule (path="*") per site, covering ALL
-         four trace providers at Verbose: WWW Server, ASP, ISAPI Extension,
-         and ASPNET, each with their full area sets, and a status code range
-         of 100-999 (i.e. captures every status code - "all content" in the
-         fullest sense).
-
-.PARAMETER DefaultDocumentName
-    Document to place at the top of the default document list. Default: portal.htm
-
-.PARAMETER WmsvcLogDirectory
-    Log directory for the Management Service. Default: E:\Logs\WMSVC
-
-.PARAMETER AspSessionTimeoutMinutes
-    Classic ASP session timeout, in minutes. Default: 15
+.PARAMETER ListBackups
+    Lists available backup timestamps and exits without changing anything.
 
 .NOTES
-    Run elevated. Backs up applicationHost.config before making changes.
-
-    All four Failed Request Tracing providers are enabled (WWW Server, ASP,
-    ISAPI Extension, ASPNET), each with their full documented area sets, per
-    Microsoft's own traceProviderDefinitions schema. ASP and ISAPI Extension
-    have no sub-areas of their own, so only provider + verbosity are set for
-    those two.
+    Run elevated. Supports -WhatIf.
+    NOTE: HTTP.sys is a kernel-mode driver - reverting MaxFieldLength /
+    MaxRequestBytes in the registry still requires a full server restart
+    before the reverted values actually take effect.
 #>
 
 #Requires -RunAsAdministrator
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
-    [string]$DefaultDocumentName        = 'portal.htm',
-    [string]$WmsvcLogDirectory          = 'E:\Logs\WMSVC',
-    [int]$AspSessionTimeoutMinutes       = 15
+    [string]$Timestamp,
+    [string]$BackupFolder = 'C:\Config-Backups',
+    [switch]$ListBackups
 )
 
 $ErrorActionPreference = 'Stop'
-Import-Module WebAdministration
 
-# Load explicitly rather than relying on WebAdministration having already
-# pulled this into the AppDomain - usually true, but not guaranteed.
-Add-Type -Path "$env:windir\System32\inetsrv\Microsoft.Web.Administration.dll" -ErrorAction SilentlyContinue
-
-$BackupFolder     = 'C:\Config-Backups'
-$Timestamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
-$BackupConfigPath = Join-Path $BackupFolder "applicationHost.config.bak_$Timestamp"
-New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
-
-$transcriptPath = Join-Path $BackupFolder "Configure-IIS-Sites_$Timestamp.log"
-Start-Transcript -Path $transcriptPath | Out-Null
-
-Write-Host "==> Backing up applicationHost.config to $BackupConfigPath" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess($BackupConfigPath, 'Copy applicationHost.config')) {
-    Copy-Item 'C:\Windows\System32\inetsrv\config\applicationHost.config' $BackupConfigPath
+if (-not (Test-Path $BackupFolder)) {
+    throw "Backup folder $BackupFolder not found - nothing to revert from."
 }
 
-# ---------------------------------------------------------------------------
-# Capture pre-change state for registry/service items NOT covered by the
-# applicationHost.config backup above, so Revert-IIS-Sites-Configuration.ps1
-# can restore the server to exactly how it was, not just "some other value".
-# For each item, $null means "did not exist before" (revert should remove it,
-# not just set it to a value) rather than "existed and was null".
-# ---------------------------------------------------------------------------
-$wmsvcKeyPath = 'HKLM:\SOFTWARE\Microsoft\WebManagement\Server'
-$httpKeyPath  = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters'
+$stateFiles = Get-ChildItem -Path $BackupFolder -Filter 'Configure-IIS-Sites_state_*.json' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending
 
-$preState = [PSCustomObject]@{
-    Timestamp             = $Timestamp
-    ConfigBackupPath      = $BackupConfigPath
-    WmsvcKeyExisted       = Test-Path $wmsvcKeyPath
-    WmsvcEnableRemoteMgmt = if (Test-Path $wmsvcKeyPath) { (Get-ItemProperty -Path $wmsvcKeyPath -Name EnableRemoteManagement -ErrorAction SilentlyContinue).EnableRemoteManagement } else { $null }
-    WmsvcLoggingDirectory = if (Test-Path $wmsvcKeyPath) { (Get-ItemProperty -Path $wmsvcKeyPath -Name LoggingDirectory -ErrorAction SilentlyContinue).LoggingDirectory } else { $null }
-    HttpKeyExisted        = Test-Path $httpKeyPath
-    HttpMaxFieldLength    = if (Test-Path $httpKeyPath) { (Get-ItemProperty -Path $httpKeyPath -Name MaxFieldLength -ErrorAction SilentlyContinue).MaxFieldLength } else { $null }
-    HttpMaxRequestBytes   = if (Test-Path $httpKeyPath) { (Get-ItemProperty -Path $httpKeyPath -Name MaxRequestBytes -ErrorAction SilentlyContinue).MaxRequestBytes } else { $null }
-    WmsvcServiceExisted   = [bool](Get-Service -Name WMSVC -ErrorAction SilentlyContinue)
-    WmsvcStartType        = (Get-Service -Name WMSVC -ErrorAction SilentlyContinue).StartType.ToString()
-    WmsvcWasRunning       = (Get-Service -Name WMSVC -ErrorAction SilentlyContinue).Status -eq 'Running'
+if ($ListBackups) {
+    Write-Host "==> Available Configure-IIS-Sites.ps1 runs in $BackupFolder" -ForegroundColor Cyan
+    if (-not $stateFiles) {
+        Write-Host "  (none found)" -ForegroundColor DarkGray
+    }
+    $stateFiles | ForEach-Object {
+        $ts = $_.BaseName -replace '.*_(\d{8}_\d{6})$', '$1'
+        Write-Host "  $ts   ($($_.LastWriteTime))"
+    }
+    return
 }
-$StateFilePath = Join-Path $BackupFolder "Configure-IIS-Sites_state_$Timestamp.json"
-$preState | ConvertTo-Json | Set-Content -Path $StateFilePath -Encoding UTF8
-Write-Host "  Pre-change state saved to $StateFilePath (needed for rollback)" -ForegroundColor DarkGray
+
+if (-not $stateFiles) {
+    throw "No 'Configure-IIS-Sites_state_*.json' files found under $BackupFolder. Nothing to revert."
+}
+
+if ($Timestamp) {
+    $stateFile = $stateFiles | Where-Object { $_.Name -like "*_$Timestamp.json" } | Select-Object -First 1
+    if (-not $stateFile) {
+        throw "No state file found matching timestamp '$Timestamp'. Run with -ListBackups to see what's available."
+    }
+}
+else {
+    $stateFile = $stateFiles | Select-Object -First 1
+    Write-Host "No -Timestamp specified - using most recent run: $($stateFile.Name)" -ForegroundColor Yellow
+}
+
+$state = Get-Content -Path $stateFile.FullName -Raw | ConvertFrom-Json
+
+if (-not (Test-Path $state.ConfigBackupPath)) {
+    throw "Config backup referenced by this state file is missing: $($state.ConfigBackupPath)"
+}
+
+Write-Host "==> Reverting Configure-IIS-Sites.ps1 run from $($state.Timestamp)" -ForegroundColor Cyan
+Write-Host "  Config backup: $($state.ConfigBackupPath)"
+
+# ---------------------------------------------------------------------------
+# 1. Stop IIS
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Stopping IIS" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('W3SVC, WAS', 'Stop services')) {
+    Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
+    Stop-Service WAS -Force -ErrorAction SilentlyContinue
+}
 
 try {
-
-$aspSessionTimeout = '{0:00}:{1:00}:00' -f [Math]::Floor($AspSessionTimeoutMinutes / 60), ($AspSessionTimeoutMinutes % 60)
-
-# ---------------------------------------------------------------------------
-# Helper: move a default document to the top of the list, using the
-# Microsoft.Web.Administration API directly for reliable ordering (the
-# WebAdministration cmdlets don't give reliable control over collection order).
-# ---------------------------------------------------------------------------
-function Set-DefaultDocumentTop {
-    param(
-        [Parameter(Mandatory)][string]$Location,   # '' for server default, or a site name
-        [Parameter(Mandatory)][string]$DocumentName
-    )
-    $mgr = New-Object Microsoft.Web.Administration.ServerManager
-    try {
-        $config  = $mgr.GetApplicationHostConfiguration()
-        $section = $config.GetSection('system.webServer/defaultDocument', $Location)
-        $section['enabled'] = $true
-        $files = $section.GetCollection('files')
-
-        $existing = $files | Where-Object { $_.GetAttributeValue('value') -eq $DocumentName }
-        if ($existing) { $files.Remove($existing) }
-
-        $newElement = $files.CreateElement('add')
-        $newElement.SetAttributeValue('value', $DocumentName)
-        $files.AddAt(0, $newElement)
-
-        $mgr.CommitChanges()
+    # -----------------------------------------------------------------------
+    # 2. Restore applicationHost.config
+    # -----------------------------------------------------------------------
+    Write-Host "`n==> Restoring applicationHost.config" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess('applicationHost.config', "Restore from $($state.ConfigBackupPath)")) {
+        Copy-Item -Path $state.ConfigBackupPath -Destination 'C:\Windows\System32\inetsrv\config\applicationHost.config' -Force
+        Write-Host "  Restored." -ForegroundColor Green
     }
-    finally {
-        # ServerManager holds file locks until disposed/GC'd
-        $mgr.Dispose()
-    }
-}
 
-# ---------------------------------------------------------------------------
-# Per-site configuration
-# ---------------------------------------------------------------------------
-$sites = Get-Website
-if (-not $sites) {
-    Write-Warning "No IIS sites found via Get-Website."
-}
+    # -----------------------------------------------------------------------
+    # 3. Restore registry values
+    # -----------------------------------------------------------------------
+    Write-Host "`n==> Restoring registry values" -ForegroundColor Cyan
+    $wmsvcKeyPath = 'HKLM:\SOFTWARE\Microsoft\WebManagement\Server'
+    $httpKeyPath  = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters'
 
-$siteResults = @()
-
-foreach ($site in $sites) {
-    $sitePsPath = "IIS:\Sites\$($site.Name)"
-    Write-Host "`n==> Configuring site: $($site.Name)" -ForegroundColor Cyan
-
-    if (-not $PSCmdlet.ShouldProcess($site.Name, 'Apply configuration baseline')) { continue }
-
-    try {
-        # --- 1. Authentication ---------------------------------------------------
-        Write-Host "  Setting Windows Authentication (Negotiate:Kerberos only, kernel-mode off)" -ForegroundColor DarkGray
-        Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' `
-            -PSPath $sitePsPath -Name 'enabled' -Value $true
-        Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' `
-            -PSPath $sitePsPath -Name 'useKernelMode' -Value $false
-
-        Clear-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -PSPath $sitePsPath
-        Add-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' `
-            -PSPath $sitePsPath -Value @{value = 'Negotiate:Kerberos' }
-
-        Write-Host "  Disabling Anonymous / Basic / Digest authentication" -ForegroundColor DarkGray
-        Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' `
-            -PSPath $sitePsPath -Name 'enabled' -Value $false
-
-        foreach ($authSection in 'basicAuthentication', 'digestAuthentication') {
-            try {
-                Set-WebConfigurationProperty -Filter "system.webServer/security/authentication/$authSection" `
-                    -PSPath $sitePsPath -Name 'enabled' -Value $false -ErrorAction Stop
-            }
-            catch {
-                Write-Host "    ($authSection section not present - role service not installed, nothing to disable)" -ForegroundColor DarkGray
-            }
+    if (-not $state.WmsvcKeyExisted) {
+        Write-Host "  $wmsvcKeyPath did not exist before - removing it entirely" -ForegroundColor DarkGray
+        if ($PSCmdlet.ShouldProcess($wmsvcKeyPath, 'Remove key')) {
+            Remove-Item -Path $wmsvcKeyPath -Recurse -Force -ErrorAction SilentlyContinue
         }
-
-        # --- 2. Logging ------------------------------------------------------------
-        Write-Host "  Setting log event destination to File + ETW" -ForegroundColor DarkGray
-        Set-ItemProperty -Path $sitePsPath -Name 'logFile.logTargetW3C' -Value 'File,ETW'
-
-        # --- 3. Default document ----------------------------------------------------
-        Write-Host "  Placing '$DefaultDocumentName' at the top of the default document list" -ForegroundColor DarkGray
-        Set-DefaultDocumentTop -Location $site.Name -DocumentName $DefaultDocumentName
-
-        # --- 5. ASP session timeout --------------------------------------------------
-        Write-Host "  Setting ASP session timeout to $AspSessionTimeoutMinutes minutes" -ForegroundColor DarkGray
-        Set-WebConfigurationProperty -Filter 'system.webServer/asp/session' -PSPath $sitePsPath `
-            -Name 'timeout' -Value $aspSessionTimeout
-
-        # --- 6. Failed Request Tracing rule: All content (*) --------------------------
-        Write-Host "  Adding Failed Request Tracing rule: All content (*)" -ForegroundColor DarkGray
-        Set-WebConfigurationProperty -Filter 'system.webServer/tracing/traceFailedRequestsLogging' `
-            -PSPath $sitePsPath -Name 'enabled' -Value $true
-
-        Clear-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath $sitePsPath -ErrorAction SilentlyContinue
-        Add-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath $sitePsPath -Value @{path = '*' }
-        Set-WebConfigurationProperty -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/failureDefinitions" `
-            -PSPath $sitePsPath -Name 'statusCodes' -Value '100-999'
-
-        # Four FRT trace providers, each per Microsoft's traceProviderDefinitions
-        # schema. ASP and ISAPI Extension have no sub-areas of their own, so
-        # 'Areas' is $null for those two and simply omitted from the hashtable.
-        $frtProviders = @(
-            @{ Provider = 'WWW Server';      Areas = 'Authentication,Security,Filter,StaticFile,CGI,Compression,Cache,RequestNotifications,Module,FastCGI,WebSocket' }
-            @{ Provider = 'ASP';              Areas = $null }
-            @{ Provider = 'ISAPI Extension';  Areas = $null }
-            @{ Provider = 'ASPNET';           Areas = 'Infrastructure,Module,Page,AppServices' }
-        )
-        foreach ($p in $frtProviders) {
-            $value = @{ provider = $p.Provider; verbosity = 'Verbose' }
-            if ($p.Areas) { $value['areas'] = $p.Areas }
-            Add-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas" `
-                -PSPath $sitePsPath -Value $value
-        }
-
-        $siteResults += [PSCustomObject]@{ Site = $site.Name; Status = 'OK'; Error = $null }
-    }
-    catch {
-        Write-Warning "Configuration FAILED for site '$($site.Name)': $($_.Exception.Message)"
-        Write-Warning "Continuing with remaining sites."
-        $siteResults += [PSCustomObject]@{ Site = $site.Name; Status = 'FAILED'; Error = $_.Exception.Message }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Server-wide defaults (so anything created later inherits the same baseline)
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Applying matching server-wide defaults (for future sites)" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set server-wide defaults')) {
-    Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' `
-        -PSPath 'IIS:\' -Name 'logTargetW3C' -Value 'File,ETW'
-    Set-DefaultDocumentTop -Location '' -DocumentName $DefaultDocumentName
-    Set-WebConfigurationProperty -Filter 'system.webServer/asp/session' -PSPath 'MACHINE/WEBROOT/APPHOST' `
-        -Name 'timeout' -Value $aspSessionTimeout -ErrorAction SilentlyContinue
-}
-
-# ---------------------------------------------------------------------------
-# 4. Management Service (WMSVC)
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
-    New-Item -ItemType Directory -Path $WmsvcLogDirectory -Force | Out-Null
-
-    # WMSVC does not always run as SYSTEM - grant whichever account it's
-    # actually configured for explicit access to the new log folder, since
-    # inherited permissions on E:\Logs may not cover that account and a
-    # mismatch here causes WMSVC to silently fail to write its own logs.
-    $wmsvcAccount = (Get-CimInstance Win32_Service -Filter "Name='WMSVC'" -ErrorAction SilentlyContinue).StartName
-    if ($wmsvcAccount) {
-        Write-Host "  WMSVC runs as '$wmsvcAccount' - granting it Modify on $WmsvcLogDirectory" -ForegroundColor DarkGray
-        icacls $WmsvcLogDirectory /grant "${wmsvcAccount}:(OI)(CI)M" /T /C | Out-Null
-    }
-
-    $wmsvcKey = 'HKLM:\SOFTWARE\Microsoft\WebManagement\Server'
-    if (-not (Test-Path $wmsvcKey)) {
-        New-Item -Path $wmsvcKey -Force | Out-Null
-    }
-    Set-ItemProperty -Path $wmsvcKey -Name 'EnableRemoteManagement' -Value 1 -Type DWord
-    Set-ItemProperty -Path $wmsvcKey -Name 'LoggingDirectory' -Value $WmsvcLogDirectory -Type String
-
-    $wmsvcService = Get-Service -Name WMSVC -ErrorAction SilentlyContinue
-    if (-not $wmsvcService) {
-        Write-Warning "WMSVC service not found - is the 'Management Service' (Web-Mgmt-Service) role service installed?"
     }
     else {
-        Set-Service -Name WMSVC -StartupType Automatic
-        Start-Service -Name WMSVC
-        Write-Host "  WMSVC set to Automatic and started. Logging to $WmsvcLogDirectory" -ForegroundColor Green
+        foreach ($pair in @(
+                @{ Name = 'EnableRemoteManagement'; Value = $state.WmsvcEnableRemoteMgmt; Type = 'DWord' }
+                @{ Name = 'LoggingDirectory';        Value = $state.WmsvcLoggingDirectory; Type = 'String' }
+            )) {
+            if ($null -eq $pair.Value) {
+                Write-Host "  $($pair.Name) did not exist before - removing it" -ForegroundColor DarkGray
+                if ($PSCmdlet.ShouldProcess("$wmsvcKeyPath\$($pair.Name)", 'Remove value')) {
+                    Remove-ItemProperty -Path $wmsvcKeyPath -Name $pair.Name -ErrorAction SilentlyContinue
+                }
+            }
+            else {
+                Write-Host "  Restoring $($pair.Name) = $($pair.Value)" -ForegroundColor DarkGray
+                if ($PSCmdlet.ShouldProcess("$wmsvcKeyPath\$($pair.Name)", 'Restore value')) {
+                    Set-ItemProperty -Path $wmsvcKeyPath -Name $pair.Name -Value $pair.Value -Type $pair.Type
+                }
+            }
+        }
+    }
+
+    if (-not $state.HttpKeyExisted) {
+        Write-Host "  $httpKeyPath did not exist before - removing it entirely" -ForegroundColor DarkGray
+        if ($PSCmdlet.ShouldProcess($httpKeyPath, 'Remove key')) {
+            Remove-Item -Path $httpKeyPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    else {
+        foreach ($pair in @(
+                @{ Name = 'MaxFieldLength';  Value = $state.HttpMaxFieldLength }
+                @{ Name = 'MaxRequestBytes'; Value = $state.HttpMaxRequestBytes }
+            )) {
+            if ($null -eq $pair.Value) {
+                Write-Host "  $($pair.Name) did not exist before - removing it" -ForegroundColor DarkGray
+                if ($PSCmdlet.ShouldProcess("$httpKeyPath\$($pair.Name)", 'Remove value')) {
+                    Remove-ItemProperty -Path $httpKeyPath -Name $pair.Name -ErrorAction SilentlyContinue
+                }
+            }
+            else {
+                Write-Host "  Restoring $($pair.Name) = $($pair.Value)" -ForegroundColor DarkGray
+                if ($PSCmdlet.ShouldProcess("$httpKeyPath\$($pair.Name)", 'Restore value')) {
+                    Set-ItemProperty -Path $httpKeyPath -Name $pair.Name -Value ([int]$pair.Value) -Type DWord
+                }
+            }
+        }
+    }
+    Write-Warning "HTTP.sys is a kernel-mode driver - a full server restart is required before the reverted MaxFieldLength/MaxRequestBytes values actually take effect."
+
+    # -----------------------------------------------------------------------
+    # 4. Restore WMSVC service state
+    # -----------------------------------------------------------------------
+    Write-Host "`n==> Restoring WMSVC service state" -ForegroundColor Cyan
+    if ($state.WmsvcServiceExisted -and (Get-Service -Name WMSVC -ErrorAction SilentlyContinue)) {
+        if ($PSCmdlet.ShouldProcess('WMSVC', "Set StartType=$($state.WmsvcStartType), Running=$($state.WmsvcWasRunning)")) {
+            Set-Service -Name WMSVC -StartupType $state.WmsvcStartType
+            if ($state.WmsvcWasRunning) {
+                Start-Service -Name WMSVC -ErrorAction SilentlyContinue
+            }
+            else {
+                Stop-Service -Name WMSVC -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "  WMSVC StartType restored to $($state.WmsvcStartType); running=$($state.WmsvcWasRunning)" -ForegroundColor Green
+        }
+    }
+    else {
+        Write-Host "  WMSVC service was not present before, or is not present now - nothing to restore." -ForegroundColor DarkGray
     }
 }
-
-# ---------------------------------------------------------------------------
-# HTTP.sys parameters: MaxFieldLength / MaxRequestBytes
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Setting HTTP.sys parameters (MaxFieldLength / MaxRequestBytes)" -ForegroundColor Cyan
-$httpParamsKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters'
-if ($PSCmdlet.ShouldProcess($httpParamsKey, 'Set MaxFieldLength / MaxRequestBytes')) {
-    if (-not (Test-Path $httpParamsKey)) {
-        New-Item -Path $httpParamsKey -Force | Out-Null
-    }
-    Set-ItemProperty -Path $httpParamsKey -Name 'MaxFieldLength' -Value 0xfffe -Type DWord
-    Set-ItemProperty -Path $httpParamsKey -Name 'MaxRequestBytes' -Value 0xfffe -Type DWord
-    Write-Host "  MaxFieldLength and MaxRequestBytes set to 0xfffe (65534)." -ForegroundColor Green
-    Write-Warning "HTTP.sys is a kernel-mode driver - these values only take effect after a full server RESTART, not just an IIS/service restart. Reboot when convenient to apply them."
+finally {
+    # -----------------------------------------------------------------------
+    # 5. Restart IIS
+    # -----------------------------------------------------------------------
+    Write-Host "`n==> Restarting IIS" -ForegroundColor Cyan
+    Start-Service WAS -ErrorAction SilentlyContinue
+    Start-Service W3SVC -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Verification" -ForegroundColor Cyan
-foreach ($site in Get-Website) {
-    $sitePsPath = "IIS:\Sites\$($site.Name)"
-    Write-Host "`n$($site.Name)" -ForegroundColor Yellow
-    [PSCustomObject]@{
-        WindowsAuthEnabled = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath $sitePsPath -Name enabled).Value
-        UseKernelMode      = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath $sitePsPath -Name useKernelMode).Value
-        Providers          = (Get-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers/add' -PSPath $sitePsPath | ForEach-Object { $_.value }) -join ', '
-        AnonymousEnabled   = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' -PSPath $sitePsPath -Name enabled).Value
-        LogTarget          = (Get-ItemProperty -Path $sitePsPath -Name logFile.logTargetW3C).Value
-        DefaultDocsTop3    = ((Get-WebConfiguration -Filter 'system.webServer/defaultDocument/files/add' -PSPath $sitePsPath | Select-Object -First 3 -ExpandProperty value) -join ', ')
-        AspSessionTimeout  = (Get-WebConfigurationProperty -Filter 'system.webServer/asp/session' -PSPath $sitePsPath -Name timeout).Value
-        FrtRulePath        = (Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add" -PSPath $sitePsPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty path)
-        FrtProviders       = ((Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas/add" -PSPath $sitePsPath -ErrorAction SilentlyContinue | ForEach-Object { $_.provider }) -join ', ')
-    } | Format-List
+foreach ($svcName in 'WAS', 'W3SVC', 'WMSVC') {
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($svc) {
+        Write-Host "  $svcName : $($svc.Status), StartType=$($svc.StartType)"
+    }
 }
 
-Write-Host "`nWMSVC status:" -ForegroundColor Yellow
-Get-Service -Name WMSVC -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType
-
-Write-Host "`nHTTP.sys parameters:" -ForegroundColor Yellow
-Get-ItemProperty -Path $httpParamsKey -ErrorAction SilentlyContinue |
-    Select-Object MaxFieldLength, MaxRequestBytes | Format-List
-Write-Host "(A server restart is required for these to take effect if this is the first time they've been set.)" -ForegroundColor DarkGray
-
-Write-Host "`nPer-site result summary:" -ForegroundColor Yellow
-$siteResults | Format-Table -AutoSize
-
-Write-Host @"
-
-NOTE on Kerberos (useKernelMode = false): with kernel-mode auth disabled,
-IIS decrypts Kerberos tickets in user mode using either the machine account
-or the application pool identity (controlled by useAppPoolCredentials, left
-at its default of false here - i.e. still the machine account). This works
-out of the box for the common case (default ApplicationPoolIdentity, SPN
-registered to the machine account). If any app pool here runs under a
-custom domain service account with its own SPN, you'll also need to set
-useAppPoolCredentials = true for that site, or Kerberos auth will fail.
-"@ -ForegroundColor DarkGray
-
-Write-Host "`nDone." -ForegroundColor Green
-}
-finally {
-    Write-Host "`nTranscript saved to $transcriptPath" -ForegroundColor DarkGray
-    Stop-Transcript | Out-Null
-}
+Write-Host "`nDone. Sites/server config restored from $($state.ConfigBackupPath)." -ForegroundColor Green
