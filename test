@@ -264,6 +264,13 @@ try {
     if ($PSCmdlet.ShouldProcess($inetStpKey, 'Set PathWWWRoot')) {
         Set-ItemProperty -Path $inetStpKey -Name 'PathWWWRoot' -Value (Join-Path $NewInetpubRoot 'wwwroot')
     }
+    # FTP is not part of this server's IIS install, but guard against a
+    # leftover/future FTP role by updating this too if it happens to exist.
+    if (Get-ItemProperty -Path $inetStpKey -Name 'PathFTPRoot' -ErrorAction SilentlyContinue) {
+        if ($PSCmdlet.ShouldProcess($inetStpKey, 'Set PathFTPRoot')) {
+            Set-ItemProperty -Path $inetStpKey -Name 'PathFTPRoot' -Value (Join-Path $NewInetpubRoot 'ftproot')
+        }
+    }
 
     Write-Host "`n==> Repointing WAS temporary app pool config path (ConfigIsolationPath)" -ForegroundColor Cyan
     # WAS writes per-app-pool temp config files under <inetpub>\temp\appPools.
@@ -290,6 +297,28 @@ try {
             }
         }
         Write-Host "  Custom error pages now served from $NewCusterrPath" -ForegroundColor Green
+    }
+
+    Write-Host "`n==> Relocating IIS configuration history path (configHistory)" -ForegroundColor Cyan
+    # The Application Host Helper Service periodically snapshots
+    # applicationHost.config to this path (default %SystemDrive%\inetpub\history).
+    # If left pointing at the old root, snapshotting silently fails once that
+    # folder is removed.
+    $newHistoryPath = Join-Path $NewInetpubRoot 'history'
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST (configHistory)', 'Repoint path')) {
+        New-Item -ItemType Directory -Path $newHistoryPath -Force | Out-Null
+        Set-WebConfigurationProperty -Filter 'system.applicationHost/configHistory' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'path' -Value $newHistoryPath
+        Write-Host "  Configuration history now written to $newHistoryPath" -ForegroundColor Green
+    }
+
+    Write-Host "`n==> Relocating httpCompression temp directory" -ForegroundColor Cyan
+    # Static/dynamic compression cache, default:
+    # %SystemDrive%\inetpub\temp\IIS Temporary Compressed Files
+    $newCompressionPath = Join-Path $NewInetpubRoot 'temp\IIS Temporary Compressed Files'
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST (httpCompression)', 'Repoint directory')) {
+        New-Item -ItemType Directory -Path $newCompressionPath -Force | Out-Null
+        Set-WebConfigurationProperty -Filter 'system.webServer/httpCompression' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'directory' -Value $newCompressionPath
+        Write-Host "  Compression cache now written to $newCompressionPath" -ForegroundColor Green
     }
 
     Write-Host "`n==> Updating siteDefaults log/trace directories" -ForegroundColor Cyan
@@ -338,6 +367,12 @@ try {
     $newAppPoolTmpCheck = Join-Path $NewInetpubRoot 'temp\appPools'
     if (-not (Test-Path $newAppPoolTmpCheck)) {
         Write-Warning "WAS temp app pool config path $newAppPoolTmpCheck is missing - WAS will fail to start if old inetpub is removed."
+        $verificationPassed = $false
+    }
+
+    $newHistoryCheck = Join-Path $NewInetpubRoot 'history'
+    if (-not (Test-Path $newHistoryCheck)) {
+        Write-Warning "Configuration history path $newHistoryCheck is missing."
         $verificationPassed = $false
     }
 
