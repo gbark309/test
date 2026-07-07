@@ -1,0 +1,179 @@
+<#
+.SYNOPSIS
+    Sets correct, locked-down NTFS permissions on the relocated inetpub
+    (D:\inetpub) and logs (E:\Logs) folders for IIS.
+
+.DESCRIPTION
+    Applies the standard Microsoft-recommended IIS permission model:
+
+    D:\inetpub (content root, e.g. wwwroot)
+        SYSTEM               - Full Control   (OI)(CI)
+        Administrators       - Full Control   (OI)(CI)
+        IIS_IUSRS            - Read & Execute (OI)(CI)
+        (all inherited permissions from the volume are stripped first)
+
+    E:\Logs\LogFiles (W3C site logs - written by the WWW service as SYSTEM)
+        SYSTEM               - Full Control   (OI)(CI)
+        Administrators       - Full Control   (OI)(CI)
+        IIS_IUSRS            - Read & Execute (OI)(CI)
+
+    E:\Logs\FailedReqLogFiles (trace logs - written by the worker process,
+    i.e. the application pool identity, which is a member of IIS_IUSRS)
+        SYSTEM               - Full Control   (OI)(CI)
+        Administrators       - Full Control   (OI)(CI)
+        IIS_IUSRS            - Modify         (OI)(CI)   <-- needs write access
+
+    Inheritance is disabled (protected) at D:\inetpub and E:\Logs so nothing
+    unexpected is inherited from the volume root, and permissions are then
+    applied recursively (/T) so existing content picks up the same ACEs.
+
+    Before making any changes, current ACLs for both trees are saved to
+    .txt files via icacls /save so they can be restored if needed.
+
+.PARAMETER InetpubRoot
+    Path to the relocated inetpub content root. Default: D:\inetpub
+
+.PARAMETER LogsRoot
+    Path to the relocated logs root. Default: E:\Logs
+
+.PARAMETER BackupFolder
+    Where to save the pre-change ACL backups. Default: C:\ACL-Backups
+
+.NOTES
+    Run elevated.
+#>
+
+#Requires -RunAsAdministrator
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [string]$InetpubRoot  = 'D:\inetpub',
+    [string]$LogsRoot     = 'E:\Logs',
+    [string]$BackupFolder = 'C:\ACL-Backups'
+)
+
+$ErrorActionPreference = 'Stop'
+
+$LogFiles  = Join-Path $LogsRoot 'LogFiles'
+$TraceLogs = Join-Path $LogsRoot 'FailedReqLogFiles'
+$Timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+foreach ($p in @($InetpubRoot, $LogsRoot, $LogFiles, $TraceLogs)) {
+    if (-not (Test-Path $p)) {
+        throw "Path not found: $p. Run the relocation script first, or check the parameter values."
+    }
+}
+# Note: wwwroot\Contents is created further down if it doesn't already exist -
+# it is intentionally not required to pre-exist.
+
+New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
+
+function Invoke-Icacls {
+    param(
+        [Parameter(Mandatory)][string[]]$IcaclsArgs,
+        [Parameter(Mandatory)][string]$Description
+    )
+    Write-Host "  $Description" -ForegroundColor DarkGray
+    Write-Host "    icacls $($IcaclsArgs -join ' ')" -ForegroundColor DarkGray
+    if ($PSCmdlet.ShouldProcess($Description, 'icacls')) {
+        $proc = Start-Process icacls -ArgumentList $IcaclsArgs -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput "$env:TEMP\icacls_out.txt" -RedirectStandardError "$env:TEMP\icacls_err.txt"
+        if ($proc.ExitCode -ne 0) {
+            Get-Content "$env:TEMP\icacls_err.txt" | Write-Warning
+            throw "icacls failed (exit $($proc.ExitCode)) on: $Description"
+        }
+    }
+}
+
+function Set-IISPermissions {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable[]]$Grants   # @{ Trustee = 'X'; Rights = 'F|M|RX' }
+    )
+
+    Write-Host "`n==> Securing $Path" -ForegroundColor Cyan
+
+    # 1. Backup current ACL
+    $backupFile = Join-Path $BackupFolder "$($Path -replace '[:\\]', '_')_$Timestamp.txt"
+    Write-Host "  Backing up current ACL to $backupFile" -ForegroundColor DarkGray
+    if ($PSCmdlet.ShouldProcess($backupFile, 'icacls /save')) {
+        Start-Process icacls -ArgumentList @("`"$Path`"", '/save', "`"$backupFile`"", '/T', '/C') -NoNewWindow -Wait | Out-Null
+    }
+
+    # 2. Break inheritance, keep nothing from the parent/volume
+    Invoke-Icacls -Description "Disable inheritance on $Path" `
+        -IcaclsArgs @("`"$Path`"", '/inheritance:r')
+
+    # 3. Best-effort strip common overly-broad default groups (ignore failures if absent)
+    foreach ($trustee in 'Users', 'Authenticated Users', 'Everyone') {
+        try {
+            Invoke-Icacls -Description "Remove '$trustee' from $Path (if present)" `
+                -IcaclsArgs @("`"$Path`"", '/remove:g', "`"$trustee`"")
+        } catch {
+            Write-Host "    ($trustee not present or already removed - continuing)" -ForegroundColor DarkGray
+        }
+    }
+
+    # 4. Grant the required trustees, applied recursively to existing content
+    foreach ($g in $Grants) {
+        Invoke-Icacls -Description "Grant $($g.Trustee) : $($g.Rights) on $Path (recursive)" `
+            -IcaclsArgs @("`"$Path`"", '/grant:r', "`"$($g.Trustee):(OI)(CI)$($g.Rights)`"", '/T', '/C')
+    }
+}
+
+# ---------------------------------------------------------------------------
+# inetpub content root
+# ---------------------------------------------------------------------------
+Set-IISPermissions -Path $InetpubRoot -Grants @(
+    @{ Trustee = 'SYSTEM';               Rights = 'F'  }
+    @{ Trustee = 'BUILTIN\Administrators'; Rights = 'F'  }
+    @{ Trustee = 'BUILTIN\IIS_IUSRS';    Rights = 'RX' }
+)
+
+# ---------------------------------------------------------------------------
+# Contents folder under wwwroot - DevGroup needs Full Control here
+# (inherits SYSTEM/Administrators/IIS_IUSRS from wwwroot above; this just
+# adds an additional explicit grant for DevGroup on top of that)
+# ---------------------------------------------------------------------------
+$ContentsFolder = Join-Path $InetpubRoot 'wwwroot\Contents'
+
+Write-Host "`n==> Ensuring $ContentsFolder exists" -ForegroundColor Cyan
+if (-not (Test-Path $ContentsFolder)) {
+    if ($PSCmdlet.ShouldProcess($ContentsFolder, 'Create directory')) {
+        New-Item -ItemType Directory -Path $ContentsFolder -Force | Out-Null
+    }
+}
+else {
+    Write-Host "  Already exists." -ForegroundColor DarkGray
+}
+
+Write-Host "`n==> Granting DOMAIN\DevGroup Full Control on $ContentsFolder" -ForegroundColor Cyan
+Invoke-Icacls -Description "Grant DOMAIN\DevGroup Full Control on $ContentsFolder (recursive)" `
+    -IcaclsArgs @("`"$ContentsFolder`"", '/grant:r', '"DOMAIN\DevGroup:(OI)(CI)F"', '/T', '/C')
+
+
+# additional explicit Modify grant for IIS_IUSRS below)
+# ---------------------------------------------------------------------------
+Set-IISPermissions -Path $LogsRoot -Grants @(
+    @{ Trustee = 'SYSTEM';               Rights = 'F'  }
+    @{ Trustee = 'BUILTIN\Administrators'; Rights = 'F'  }
+    @{ Trustee = 'BUILTIN\IIS_IUSRS';    Rights = 'RX' }
+    @{ Trustee = 'DOMAIN\DevGroup';      Rights = 'RX' }
+)
+
+# FailedReqLogFiles is written by the worker process (app pool identity,
+# a member of IIS_IUSRS) - it needs Modify, not just Read & Execute.
+Write-Host "`n==> Granting IIS_IUSRS Modify on $TraceLogs (trace logs are written by worker processes)" -ForegroundColor Cyan
+Invoke-Icacls -Description "Grant BUILTIN\IIS_IUSRS Modify on $TraceLogs (recursive)" `
+    -IcaclsArgs @("`"$TraceLogs`"", '/grant:r', '"BUILTIN\IIS_IUSRS:(OI)(CI)M"', '/T', '/C')
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Resulting permissions" -ForegroundColor Cyan
+foreach ($p in @($InetpubRoot, $ContentsFolder, $LogsRoot, $LogFiles, $TraceLogs)) {
+    Write-Host "`n$p" -ForegroundColor Yellow
+    icacls $p
+}
+
+Write-Host "`nDone. ACL backups saved under $BackupFolder (restore with: icacls <path> /restore <backupfile>)." -ForegroundColor Green
