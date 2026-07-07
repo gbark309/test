@@ -146,6 +146,20 @@ if ($PSCmdlet.ShouldProcess($inetStpKey, 'Set PathWWWRoot')) {
 # ---------------------------------------------------------------------------
 # 7. Update applicationHost.config - site defaults for logs/trace logs
 # ---------------------------------------------------------------------------
+Write-Host "`n==> Relocating custom error page path (httpErrors) off the old inetpub root" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST (httpErrors)', 'Repoint prefixLanguageFilePath')) {
+    $NewCusterrPath = Join-Path $NewInetpubRoot 'custerr'
+    $errorEntries = Get-WebConfiguration '/system.webServer/httpErrors/error' -PSPath 'MACHINE/WEBROOT/APPHOST'
+    foreach ($entry in $errorEntries) {
+        $expandedPrefix = [Environment]::ExpandEnvironmentVariables($entry.prefixLanguageFilePath)
+        if ($expandedPrefix -like "$OldInetpubRoot*") {
+            $filter = "/system.webServer/httpErrors/error[@statusCode='$($entry.statusCode)' and @subStatusCode='$($entry.subStatusCode)']"
+            Set-WebConfigurationProperty -Filter $filter -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'prefixLanguageFilePath' -Value $NewCusterrPath
+        }
+    }
+    Write-Host "  Custom error pages now served from $NewCusterrPath" -ForegroundColor Green
+}
+
 Write-Host "`n==> Updating siteDefaults log/trace directories" -ForegroundColor Cyan
 if ($PSCmdlet.ShouldProcess('IIS:\ (siteDefaults)', 'Set default log/trace directories')) {
     Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' `
@@ -153,6 +167,7 @@ if ($PSCmdlet.ShouldProcess('IIS:\ (siteDefaults)', 'Set default log/trace direc
     Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/traceFailedRequestsLogging' `
         -Name 'directory' -Value $TraceLogsTarget -PSPath 'IIS:\'
 }
+
 
 # ---------------------------------------------------------------------------
 # 8. Update every existing site: physicalPath + per-site log/trace directory
@@ -279,11 +294,77 @@ foreach ($p in @($OldLogFiles, $OldTraceLogs)) {
     }
 }
 
+function Remove-DirectoryRobust {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path $Path)) { return }
+
+    # Step 9 restarted IIS, which re-locks server-wide resources like the
+    # default custom error pages (500-100.asp etc.) unless they were
+    # relocated - stop everything again right before deleting.
+    Write-Host "  Stopping IIS services/worker processes before cleanup..." -ForegroundColor DarkGray
+    Get-Process w3wp -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
+    Stop-Service WAS -Force -ErrorAction SilentlyContinue
+
+    try {
+        Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+        Start-Service WAS -ErrorAction SilentlyContinue
+        Start-Service W3SVC -ErrorAction SilentlyContinue
+        return
+    }
+    catch {
+        Write-Warning "Standard removal of $Path failed ($($_.Exception.Message)). Repairing ownership/ACLs and retrying..."
+    }
+
+    # /A takes ownership for the Administrators group specifically - needed
+    # for files owned by TrustedInstaller (e.g. default custerr pages).
+    Start-Process takeown -ArgumentList @('/F', "`"$Path`"", '/R', '/D', 'Y', '/A') -NoNewWindow -Wait | Out-Null
+    Start-Process icacls -ArgumentList @("`"$Path`"", '/reset', '/T', '/C') -NoNewWindow -Wait | Out-Null
+    Start-Process icacls -ArgumentList @("`"$Path`"", '/grant', 'Administrators:F', '/T', '/C') -NoNewWindow -Wait | Out-Null
+    Start-Process attrib -ArgumentList @('-R', '-S', '-H', "`"$Path\*.*`"", '/S', '/D') -NoNewWindow -Wait | Out-Null
+
+    try {
+        Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+        Start-Service WAS -ErrorAction SilentlyContinue
+        Start-Service W3SVC -ErrorAction SilentlyContinue
+        return
+    }
+    catch {
+        Write-Warning "Removal of $Path still failed after ownership/ACL repair ($($_.Exception.Message)). Falling back to robocopy purge..."
+    }
+
+    $emptyDir = Join-Path $env:TEMP "empty_$([guid]::NewGuid())"
+    New-Item -ItemType Directory -Path $emptyDir | Out-Null
+    Start-Process robocopy -ArgumentList @("`"$emptyDir`"", "`"$Path`"", '/MIR', '/R:1', '/W:1', '/NFL', '/NDL', '/NP') -NoNewWindow -Wait | Out-Null
+    Remove-Item -Path $emptyDir -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
+
+    if (Test-Path $Path) {
+        Write-Warning "Files remain locked even after ownership repair and robocopy purge. Forcing deletion via a SYSTEM-context scheduled task..."
+        $taskName = "ForceDelete_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $cmd = "cmd.exe /c rmdir /s /q `"$Path`""
+        schtasks /create /tn $taskName /tr $cmd /sc once /st 00:00 /ru SYSTEM /rl highest /f | Out-Null
+        schtasks /run /tn $taskName | Out-Null
+        Start-Sleep -Seconds 5
+        schtasks /delete /tn $taskName /f -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    Start-Service WAS -ErrorAction SilentlyContinue
+    Start-Service W3SVC -ErrorAction SilentlyContinue
+
+    if (Test-Path $Path) {
+        Write-Warning "Could not fully remove $Path even via SYSTEM task. Manual investigation required (check open handles with Sysinternals handle.exe)."
+    }
+    else {
+        Write-Host "Removed $Path." -ForegroundColor Green
+    }
+}
+
 if ($verificationPassed) {
     Write-Host "All checks passed. Removing old content at $OldInetpubRoot ..." -ForegroundColor Green
     if ($PSCmdlet.ShouldProcess($OldInetpubRoot, 'Remove old inetpub content')) {
-        Remove-Item -Path $OldInetpubRoot -Recurse -Force
-        Write-Host "Removed $OldInetpubRoot." -ForegroundColor Green
+        Remove-DirectoryRobust -Path $OldInetpubRoot
     }
 }
 else {
