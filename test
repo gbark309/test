@@ -265,6 +265,20 @@ try {
         Set-ItemProperty -Path $inetStpKey -Name 'PathWWWRoot' -Value (Join-Path $NewInetpubRoot 'wwwroot')
     }
 
+    Write-Host "`n==> Repointing WAS temporary app pool config path (ConfigIsolationPath)" -ForegroundColor Cyan
+    # WAS writes per-app-pool temp config files under <inetpub>\temp\appPools.
+    # This location is NOT derived from PathWWWRoot above - it has its own
+    # registry value - so it must be set explicitly or WAS will fail to start
+    # once the old inetpub root is removed ("directory specified for temporary
+    # application pool config files is either missing or not accessible").
+    $wasParamsKey  = 'HKLM:\SYSTEM\CurrentControlSet\Services\WAS\Parameters'
+    $newAppPoolTmp = Join-Path $NewInetpubRoot 'temp\appPools'
+    if ($PSCmdlet.ShouldProcess($wasParamsKey, 'Set ConfigIsolationPath')) {
+        New-Item -ItemType Directory -Path $newAppPoolTmp -Force | Out-Null
+        Set-ItemProperty -Path $wasParamsKey -Name 'ConfigIsolationPath' -Value $newAppPoolTmp -Type String
+        Write-Host "  WAS temp app pool config path set to $newAppPoolTmp" -ForegroundColor Green
+    }
+
     Write-Host "`n==> Relocating custom error page path (httpErrors) off the old inetpub root" -ForegroundColor Cyan
     if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST (httpErrors)', 'Repoint prefixLanguageFilePath')) {
         $errorEntries = Get-WebConfiguration '/system.webServer/httpErrors/error' -PSPath 'MACHINE/WEBROOT/APPHOST'
@@ -318,6 +332,12 @@ try {
     $newWwwroot = Join-Path $NewInetpubRoot 'wwwroot'
     if (-not (Test-Path $newWwwroot) -or -not (Get-ChildItem $newWwwroot -ErrorAction SilentlyContinue)) {
         Write-Warning "New wwwroot at $newWwwroot is missing or empty."
+        $verificationPassed = $false
+    }
+
+    $newAppPoolTmpCheck = Join-Path $NewInetpubRoot 'temp\appPools'
+    if (-not (Test-Path $newAppPoolTmpCheck)) {
+        Write-Warning "WAS temp app pool config path $newAppPoolTmpCheck is missing - WAS will fail to start if old inetpub is removed."
         $verificationPassed = $false
     }
 
