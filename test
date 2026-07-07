@@ -1,378 +1,361 @@
 <#
 .SYNOPSIS
-    Sets correct, locked-down NTFS permissions on the relocated inetpub
-    (D:\inetpub) and logs (E:\Logs) folders for IIS.
+    Applies a standard configuration baseline across all IIS sites on this
+    server: Windows Authentication (Kerberos-only), dual log targets, a
+    default document, the Management Service, ASP session timeout, and
+    Failed Request Tracing rules.
 
 .DESCRIPTION
-    Applies the standard Microsoft-recommended IIS permission model. For each
-    path, ownership is set to BUILTIN\Administrators BEFORE granting - this
-    means the grant step can never be blocked by a stuck ACL, an unexpected
-    owner, or a stray Deny entry left over from a previous state, since the
-    owner of an object can always rewrite its DACL regardless of what's
-    currently on it.
+    For EVERY site returned by Get-Website, this script:
 
-    D:\inetpub (content root, e.g. wwwroot)
-        SYSTEM               - Full Control   (OI)(CI)
-        Administrators       - Full Control   (OI)(CI)
-        IIS_IUSRS            - Read & Execute (OI)(CI)
-        (all inherited permissions from the volume are stripped first)
+    1. Authentication
+       - Enables Windows Authentication
+       - Sets providers to ONLY "Negotiate:Kerberos" (removes Negotiate/NTLM
+         fallback - Kerberos-only, no NTLM negotiation)
+       - Disables useKernelMode (required when using Negotiate:Kerberos-only -
+         see Microsoft guidance: kernel-mode auth must be off for this provider)
+       - Disables Anonymous, Basic, and Digest authentication
+         (Basic/Digest sections may not exist since those role services were
+         never installed - handled gracefully if so)
 
-    E:\Logs (W3C site logs go directly here - written by the WWW service as SYSTEM)
-        SYSTEM               - Full Control   (OI)(CI)
-        Administrators       - Full Control   (OI)(CI)
-        IIS_IUSRS            - Read & Execute (OI)(CI)
+    2. Logging
+       - logFile.logTargetW3C = "File,ETW" (Log Event Destination: Both Log
+         File and ETW Event), set at siteDefaults and per-site
 
-    E:\Logs\FailedReqLogFiles (trace logs - written by the worker process,
-    i.e. the application pool identity, which is a member of IIS_IUSRS)
-        SYSTEM               - Full Control   (OI)(CI)
-        Administrators       - Full Control   (OI)(CI)
-        IIS_IUSRS            - Modify         (OI)(CI)   <-- needs write access
+    3. Default Document
+       - Ensures "portal.htm" exists in the default document list and moves
+         it to the TOP of the list (first document IIS will look for),
+         applied at the server default and per-site
 
-    Inheritance is disabled (protected) at D:\inetpub and E:\Logs so nothing
-    unexpected is inherited from the volume root, and permissions are then
-    applied recursively (/T) so existing content picks up the same ACEs.
+    4. Management Service (WMSVC)
+       - Enables remote management (registry)
+       - Redirects its logging to E:\Logs\WMSVC
+       - Sets the service to Automatic startup and starts it
 
-    Before making any changes, current ACLs for both trees are saved to
-    .txt files via icacls /save so they can be restored if needed.
+    5b. HTTP.sys parameters
+       - HKLM\SYSTEM\CurrentControlSet\Services\HTTP\Parameters
+         MaxFieldLength  = 0xfffe (DWORD)
+         MaxRequestBytes = 0xfffe (DWORD)
+       - NOTE: HTTP.sys is a kernel-mode driver; these only take effect after
+         a full server restart, not just an IIS or service restart.
 
-.PARAMETER InetpubRoot
-    Path to the relocated inetpub content root. Default: D:\inetpub
+    5. ASP Session Properties
+       - Classic ASP session timeout set to 15 minutes (system.webServer/asp/session)
 
-.PARAMETER LogsRoot
-    Path to the relocated logs root. Default: E:\Logs
+    6. Failed Request Tracing Rules
+       - Adds an "All content (*)" rule (path="*") per site, covering ALL
+         four trace providers at Verbose: WWW Server, ASP, ISAPI Extension,
+         and ASPNET, each with their full area sets, and a status code range
+         of 100-999 (i.e. captures every status code - "all content" in the
+         fullest sense).
 
-.PARAMETER BackupFolder
-    Where to save the pre-change ACL backups. Default: C:\ACL-Backups
+.PARAMETER DefaultDocumentName
+    Document to place at the top of the default document list. Default: portal.htm
 
-.PARAMETER LogRetentionDays
-    Log/trace files older than this many days are deleted by the scheduled
-    cleanup task. Default: 180 (~6 months).
+.PARAMETER WmsvcLogDirectory
+    Log directory for the Management Service. Default: E:\Logs\WMSVC
 
-.PARAMETER SkipScheduledTask
-    If set, skips creating/updating the daily log-cleanup scheduled task.
-
-.PARAMETER Environment
-    Required. 'dev' grants DOMAIN\DevGroup Full Control on
-    wwwroot\Contents; 'prod' grants DOMAIN\DevGroup Read & Execute only.
+.PARAMETER AspSessionTimeoutMinutes
+    Classic ASP session timeout, in minutes. Default: 15
 
 .NOTES
-    Run elevated.
+    Run elevated. Backs up applicationHost.config before making changes.
+
+    All four Failed Request Tracing providers are enabled (WWW Server, ASP,
+    ISAPI Extension, ASPNET), each with their full documented area sets, per
+    Microsoft's own traceProviderDefinitions schema. ASP and ISAPI Extension
+    have no sub-areas of their own, so only provider + verbosity are set for
+    those two.
 #>
 
 #Requires -RunAsAdministrator
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$InetpubRoot  = 'D:\inetpub',
-    [string]$LogsRoot     = 'E:\Logs',
-    [string]$BackupFolder = 'C:\ACL-Backups',
-    [int]$LogRetentionDays = 180,
-    [switch]$SkipScheduledTask,
-
-    [Parameter(Mandatory)]
-    [ValidateSet('dev', 'prod')]
-    [string]$Environment
+    [string]$DefaultDocumentName        = 'portal.htm',
+    [string]$WmsvcLogDirectory          = 'E:\Logs\WMSVC',
+    [int]$AspSessionTimeoutMinutes       = 15
 )
 
 $ErrorActionPreference = 'Stop'
+Import-Module WebAdministration
 
-$LogFiles  = $LogsRoot   # W3C logs now live directly under LogsRoot, not a LogFiles subfolder
-$TraceLogs = Join-Path $LogsRoot 'FailedReqLogFiles'
-$Timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+# Load explicitly rather than relying on WebAdministration having already
+# pulled this into the AppDomain - usually true, but not guaranteed.
+Add-Type -Path "$env:windir\System32\inetsrv\Microsoft.Web.Administration.dll" -ErrorAction SilentlyContinue
 
-foreach ($p in @($InetpubRoot, $LogsRoot, $TraceLogs)) {
-    if (-not (Test-Path $p)) {
-        throw "Path not found: $p. Run the relocation script first, or check the parameter values."
-    }
-}
-# Note: wwwroot\Contents is created further down if it doesn't already exist -
-# it is intentionally not required to pre-exist.
-
+$BackupFolder     = 'C:\Config-Backups'
+$Timestamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
+$BackupConfigPath = Join-Path $BackupFolder "applicationHost.config.bak_$Timestamp"
 New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
 
-$transcriptPath = Join-Path $BackupFolder "Set-IIS-Permissions_$Timestamp.log"
+$transcriptPath = Join-Path $BackupFolder "Configure-IIS-Sites_$Timestamp.log"
 Start-Transcript -Path $transcriptPath | Out-Null
-Write-Host "Transcript logging to $transcriptPath" -ForegroundColor DarkGray
 
-function Invoke-Icacls {
-    param(
-        [Parameter(Mandatory)][string[]]$IcaclsArgs,
-        [Parameter(Mandatory)][string]$Description
-    )
-    Write-Host "  $Description" -ForegroundColor DarkGray
-    Write-Host "    icacls $($IcaclsArgs -join ' ')" -ForegroundColor DarkGray
-    if ($PSCmdlet.ShouldProcess($Description, 'icacls')) {
-        $proc = Start-Process icacls -ArgumentList $IcaclsArgs -NoNewWindow -Wait -PassThru `
-            -RedirectStandardOutput "$env:TEMP\icacls_out.txt" -RedirectStandardError "$env:TEMP\icacls_err.txt"
-        if ($proc.ExitCode -ne 0) {
-            Get-Content "$env:TEMP\icacls_err.txt" | Write-Warning
-            throw "icacls failed (exit $($proc.ExitCode)) on: $Description"
-        }
-    }
-}
-
-function Set-IISPermissions {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][hashtable[]]$Grants,   # @{ Trustee = 'X'; Rights = 'F|M|RX' }
-        [bool]$Recurse = $true
-    )
-
-    Write-Host "`n==> Securing $Path$(if (-not $Recurse) { ' (this folder only, not recursive)' })" -ForegroundColor Cyan
-
-    # 1. Backup current ACL
-    $backupFile = Join-Path $BackupFolder "$($Path -replace '[:\\]', '_')_$Timestamp.txt"
-    Write-Host "  Backing up current ACL to $backupFile" -ForegroundColor DarkGray
-    if ($PSCmdlet.ShouldProcess($backupFile, 'icacls /save')) {
-        $saveArgs = @("`"$Path`"", '/save', "`"$backupFile`"", '/C')
-        if ($Recurse) { $saveArgs += '/T' }
-        Start-Process icacls -ArgumentList $saveArgs -NoNewWindow -Wait | Out-Null
-    }
-
-    # 2. Take ownership as Administrators BEFORE granting. This matters
-    #    because /grant:r can still be blocked by an unexpected owner or a
-    #    stray Deny ACE on the object; the owner can always rewrite the DACL
-    #    regardless of its current contents, so doing this first makes the
-    #    grant step below unconditionally reliable rather than dependent on
-    #    whatever state the ACL happens to be in.
-    $takeownArgs = @("`"$Path`"", '/setowner', '"BUILTIN\Administrators"')
-    if ($Recurse) { $takeownArgs += '/T' }
-    $takeownArgs += '/C'
-    Invoke-Icacls -Description "Set owner to BUILTIN\Administrators on $Path$(if ($Recurse) { ' (recursive)' })" `
-        -IcaclsArgs $takeownArgs
-
-    # 3. Grant the new trustees, while the existing (inherited or
-    #    legacy) ACEs are still in place. This is deliberately ordered before
-    #    steps 4/5 below: /grant:r only ADDS an explicit ACE, it never removes
-    #    access, so if this step fails partway (e.g. one trustee name doesn't
-    #    resolve, or icacls hits a transient error), the folder still has
-    #    whatever access it had before this script ran - never zero access.
-    #    -Recurse:$false is used for D:\inetpub itself so this does NOT walk
-    #    into temp\appPools (WAS manages its own per-app-pool isolated ACLs
-    #    there - see note at the call site below).
-    foreach ($g in $Grants) {
-        $grantArgs = @("`"$Path`"", '/grant:r', "`"$($g.Trustee):(OI)(CI)$($g.Rights)`"", '/C')
-        if ($Recurse) { $grantArgs += '/T' }
-        Invoke-Icacls -Description "Grant $($g.Trustee) : $($g.Rights) on $Path$(if ($Recurse) { ' (recursive)' })" `
-            -IcaclsArgs $grantArgs
-    }
-
-    # 4. Only after the new grants are confirmed in place: best-effort strip
-    #    common overly-broad default groups.
-    foreach ($trustee in 'Users', 'Authenticated Users', 'Everyone') {
-        try {
-            Invoke-Icacls -Description "Remove '$trustee' from $Path (if present)" `
-                -IcaclsArgs @("`"$Path`"", '/remove:g', "`"$trustee`"")
-        } catch {
-            Write-Host "    ($trustee not present or already removed - continuing)" -ForegroundColor DarkGray
-        }
-    }
-
-    # 5. Break inheritance last. This only strips INHERITED ACEs - the
-    #    explicit grants from step 3 are untouched, so this is safe even if
-    #    steps 3/4 above encountered partial issues.
-    Invoke-Icacls -Description "Disable inheritance on $Path" `
-        -IcaclsArgs @("`"$Path`"", '/inheritance:r')
+Write-Host "==> Backing up applicationHost.config to $BackupConfigPath" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess($BackupConfigPath, 'Copy applicationHost.config')) {
+    Copy-Item 'C:\Windows\System32\inetsrv\config\applicationHost.config' $BackupConfigPath
 }
 
 # ---------------------------------------------------------------------------
-# inetpub content root
+# Capture pre-change state for registry/service items NOT covered by the
+# applicationHost.config backup above, so Revert-IIS-Sites-Configuration.ps1
+# can restore the server to exactly how it was, not just "some other value".
+# For each item, $null means "did not exist before" (revert should remove it,
+# not just set it to a value) rather than "existed and was null".
 # ---------------------------------------------------------------------------
+$wmsvcKeyPath = 'HKLM:\SOFTWARE\Microsoft\WebManagement\Server'
+$httpKeyPath  = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters'
+
+$preState = [PSCustomObject]@{
+    Timestamp             = $Timestamp
+    ConfigBackupPath      = $BackupConfigPath
+    WmsvcKeyExisted       = Test-Path $wmsvcKeyPath
+    WmsvcEnableRemoteMgmt = if (Test-Path $wmsvcKeyPath) { (Get-ItemProperty -Path $wmsvcKeyPath -Name EnableRemoteManagement -ErrorAction SilentlyContinue).EnableRemoteManagement } else { $null }
+    WmsvcLoggingDirectory = if (Test-Path $wmsvcKeyPath) { (Get-ItemProperty -Path $wmsvcKeyPath -Name LoggingDirectory -ErrorAction SilentlyContinue).LoggingDirectory } else { $null }
+    HttpKeyExisted        = Test-Path $httpKeyPath
+    HttpMaxFieldLength    = if (Test-Path $httpKeyPath) { (Get-ItemProperty -Path $httpKeyPath -Name MaxFieldLength -ErrorAction SilentlyContinue).MaxFieldLength } else { $null }
+    HttpMaxRequestBytes   = if (Test-Path $httpKeyPath) { (Get-ItemProperty -Path $httpKeyPath -Name MaxRequestBytes -ErrorAction SilentlyContinue).MaxRequestBytes } else { $null }
+    WmsvcServiceExisted   = [bool](Get-Service -Name WMSVC -ErrorAction SilentlyContinue)
+    WmsvcStartType        = (Get-Service -Name WMSVC -ErrorAction SilentlyContinue).StartType.ToString()
+    WmsvcWasRunning       = (Get-Service -Name WMSVC -ErrorAction SilentlyContinue).Status -eq 'Running'
+}
+$StateFilePath = Join-Path $BackupFolder "Configure-IIS-Sites_state_$Timestamp.json"
+$preState | ConvertTo-Json | Set-Content -Path $StateFilePath -Encoding UTF8
+Write-Host "  Pre-change state saved to $StateFilePath (needed for rollback)" -ForegroundColor DarkGray
+
 try {
-# IMPORTANT: applied WITHOUT recursion here. D:\inetpub\temp\appPools contains
-# WAS-managed, per-app-pool isolated ACLs (each pool's temp config folder is
-# deliberately protected/non-inheriting so pools can't read each other's
-# config). A blanket recursive grant across the whole tree would stamp
-# IIS_IUSRS/SYSTEM/Administrators onto those folders too, weakening that
-# isolation - this is also what caused WAS to fail to start during this
-# migration previously. Setting the root non-recursively still establishes
-# (OI)(CI) inheritance for anything newly created under it going forward;
-# existing content folders that actually need consistent permissions are
-# handled explicitly, recursively, below.
-Set-IISPermissions -Path $InetpubRoot -Recurse:$false -Grants @(
-    @{ Trustee = 'SYSTEM';               Rights = 'F'  }
-    @{ Trustee = 'BUILTIN\Administrators'; Rights = 'F'  }
-    @{ Trustee = 'BUILTIN\IIS_IUSRS';    Rights = 'RX' }
-)
 
-# Recursively normalize permissions on existing content folders only -
-# deliberately excludes temp\appPools (see note above) and the compression
-# cache under temp, both of which IIS/WAS manage themselves.
-foreach ($contentFolder in 'wwwroot', 'custerr', 'history') {
-    $fullPath = Join-Path $InetpubRoot $contentFolder
-    if (Test-Path $fullPath) {
-        $grants = @(
-            @{ Trustee = 'SYSTEM';               Rights = 'F'  }
-            @{ Trustee = 'BUILTIN\Administrators'; Rights = 'F'  }
-            @{ Trustee = 'BUILTIN\IIS_IUSRS';    Rights = 'RX' }
-        )
-        # NETWORK / NETWORK SERVICE are needed on wwwroot specifically - e.g.
-        # for app pools running under the legacy NetworkService identity, or
-        # other components that authenticate via those built-in accounts
-        # rather than through IIS_IUSRS.
-        if ($contentFolder -eq 'wwwroot') {
-            $grants += @{ Trustee = 'NT AUTHORITY\NETWORK';         Rights = 'RX' }
-            $grants += @{ Trustee = 'NT AUTHORITY\NETWORK SERVICE'; Rights = 'RX' }
+$aspSessionTimeout = '{0:00}:{1:00}:00' -f [Math]::Floor($AspSessionTimeoutMinutes / 60), ($AspSessionTimeoutMinutes % 60)
+
+# ---------------------------------------------------------------------------
+# Helper: move a default document to the top of the list, using the
+# Microsoft.Web.Administration API directly for reliable ordering (the
+# WebAdministration cmdlets don't give reliable control over collection order).
+# ---------------------------------------------------------------------------
+function Set-DefaultDocumentTop {
+    param(
+        [Parameter(Mandatory)][string]$Location,   # '' for server default, or a site name
+        [Parameter(Mandatory)][string]$DocumentName
+    )
+    $mgr = New-Object Microsoft.Web.Administration.ServerManager
+    try {
+        $config  = $mgr.GetApplicationHostConfiguration()
+        $section = $config.GetSection('system.webServer/defaultDocument', $Location)
+        $section['enabled'] = $true
+        $files = $section.GetCollection('files')
+
+        $existing = $files | Where-Object { $_.GetAttributeValue('value') -eq $DocumentName }
+        if ($existing) { $files.Remove($existing) }
+
+        $newElement = $files.CreateElement('add')
+        $newElement.SetAttributeValue('value', $DocumentName)
+        $files.AddAt(0, $newElement)
+
+        $mgr.CommitChanges()
+    }
+    finally {
+        # ServerManager holds file locks until disposed/GC'd
+        $mgr.Dispose()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Per-site configuration
+# ---------------------------------------------------------------------------
+$sites = Get-Website
+if (-not $sites) {
+    Write-Warning "No IIS sites found via Get-Website."
+}
+
+$siteResults = @()
+
+foreach ($site in $sites) {
+    $sitePsPath = "IIS:\Sites\$($site.Name)"
+    Write-Host "`n==> Configuring site: $($site.Name)" -ForegroundColor Cyan
+
+    if (-not $PSCmdlet.ShouldProcess($site.Name, 'Apply configuration baseline')) { continue }
+
+    try {
+        # --- 1. Authentication ---------------------------------------------------
+        Write-Host "  Setting Windows Authentication (Negotiate:Kerberos only, kernel-mode off)" -ForegroundColor DarkGray
+        Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' `
+            -PSPath $sitePsPath -Name 'enabled' -Value $true
+        Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' `
+            -PSPath $sitePsPath -Name 'useKernelMode' -Value $false
+
+        Clear-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -PSPath $sitePsPath
+        Add-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' `
+            -PSPath $sitePsPath -Value @{value = 'Negotiate:Kerberos' }
+
+        Write-Host "  Disabling Anonymous / Basic / Digest authentication" -ForegroundColor DarkGray
+        Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' `
+            -PSPath $sitePsPath -Name 'enabled' -Value $false
+
+        foreach ($authSection in 'basicAuthentication', 'digestAuthentication') {
+            try {
+                Set-WebConfigurationProperty -Filter "system.webServer/security/authentication/$authSection" `
+                    -PSPath $sitePsPath -Name 'enabled' -Value $false -ErrorAction Stop
+            }
+            catch {
+                Write-Host "    ($authSection section not present - role service not installed, nothing to disable)" -ForegroundColor DarkGray
+            }
         }
-        Set-IISPermissions -Path $fullPath -Recurse:$true -Grants $grants
+
+        # --- 2. Logging ------------------------------------------------------------
+        Write-Host "  Setting log event destination to File + ETW" -ForegroundColor DarkGray
+        Set-ItemProperty -Path $sitePsPath -Name 'logFile.logTargetW3C' -Value 'File,ETW'
+
+        # --- 3. Default document ----------------------------------------------------
+        Write-Host "  Placing '$DefaultDocumentName' at the top of the default document list" -ForegroundColor DarkGray
+        Set-DefaultDocumentTop -Location $site.Name -DocumentName $DefaultDocumentName
+
+        # --- 5. ASP session timeout --------------------------------------------------
+        Write-Host "  Setting ASP session timeout to $AspSessionTimeoutMinutes minutes" -ForegroundColor DarkGray
+        Set-WebConfigurationProperty -Filter 'system.webServer/asp/session' -PSPath $sitePsPath `
+            -Name 'timeout' -Value $aspSessionTimeout
+
+        # --- 6. Failed Request Tracing rule: All content (*) --------------------------
+        Write-Host "  Adding Failed Request Tracing rule: All content (*)" -ForegroundColor DarkGray
+        Set-WebConfigurationProperty -Filter 'system.webServer/tracing/traceFailedRequestsLogging' `
+            -PSPath $sitePsPath -Name 'enabled' -Value $true
+
+        Clear-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath $sitePsPath -ErrorAction SilentlyContinue
+        Add-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath $sitePsPath -Value @{path = '*' }
+        Set-WebConfigurationProperty -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/failureDefinitions" `
+            -PSPath $sitePsPath -Name 'statusCodes' -Value '100-999'
+
+        # Four FRT trace providers, each per Microsoft's traceProviderDefinitions
+        # schema. ASP and ISAPI Extension have no sub-areas of their own, so
+        # 'Areas' is $null for those two and simply omitted from the hashtable.
+        $frtProviders = @(
+            @{ Provider = 'WWW Server';      Areas = 'Authentication,Security,Filter,StaticFile,CGI,Compression,Cache,RequestNotifications,Module,FastCGI,WebSocket' }
+            @{ Provider = 'ASP';              Areas = $null }
+            @{ Provider = 'ISAPI Extension';  Areas = $null }
+            @{ Provider = 'ASPNET';           Areas = 'Infrastructure,Module,Page,AppServices' }
+        )
+        foreach ($p in $frtProviders) {
+            $value = @{ provider = $p.Provider; verbosity = 'Verbose' }
+            if ($p.Areas) { $value['areas'] = $p.Areas }
+            Add-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas" `
+                -PSPath $sitePsPath -Value $value
+        }
+
+        $siteResults += [PSCustomObject]@{ Site = $site.Name; Status = 'OK'; Error = $null }
+    }
+    catch {
+        Write-Warning "Configuration FAILED for site '$($site.Name)': $($_.Exception.Message)"
+        Write-Warning "Continuing with remaining sites."
+        $siteResults += [PSCustomObject]@{ Site = $site.Name; Status = 'FAILED'; Error = $_.Exception.Message }
     }
 }
 
 # ---------------------------------------------------------------------------
-# Contents folder under wwwroot - DevGroup's rights here depend on -Environment:
-#   dev  -> Full Control (developers can deploy/modify content directly)
-#   prod -> Read & Execute only (no direct write access in production)
-# (inherits SYSTEM/Administrators/IIS_IUSRS from wwwroot above; this just
-# adds an additional explicit grant for DevGroup on top of that)
+# Server-wide defaults (so anything created later inherits the same baseline)
 # ---------------------------------------------------------------------------
-$ContentsFolder = Join-Path $InetpubRoot 'wwwroot\Contents'
-$devGroupRights = if ($Environment -eq 'dev') { 'F' } else { 'RX' }
-$devGroupRightsLabel = if ($Environment -eq 'dev') { 'Full Control' } else { 'Read & Execute' }
+Write-Host "`n==> Applying matching server-wide defaults (for future sites)" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set server-wide defaults')) {
+    Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' `
+        -PSPath 'IIS:\' -Name 'logTargetW3C' -Value 'File,ETW'
+    Set-DefaultDocumentTop -Location '' -DocumentName $DefaultDocumentName
+    Set-WebConfigurationProperty -Filter 'system.webServer/asp/session' -PSPath 'MACHINE/WEBROOT/APPHOST' `
+        -Name 'timeout' -Value $aspSessionTimeout -ErrorAction SilentlyContinue
+}
 
-Write-Host "`n==> Ensuring $ContentsFolder exists" -ForegroundColor Cyan
-if (-not (Test-Path $ContentsFolder)) {
-    if ($PSCmdlet.ShouldProcess($ContentsFolder, 'Create directory')) {
-        New-Item -ItemType Directory -Path $ContentsFolder -Force | Out-Null
+# ---------------------------------------------------------------------------
+# 4. Management Service (WMSVC)
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
+    New-Item -ItemType Directory -Path $WmsvcLogDirectory -Force | Out-Null
+
+    # WMSVC does not always run as SYSTEM - grant whichever account it's
+    # actually configured for explicit access to the new log folder, since
+    # inherited permissions on E:\Logs may not cover that account and a
+    # mismatch here causes WMSVC to silently fail to write its own logs.
+    $wmsvcAccount = (Get-CimInstance Win32_Service -Filter "Name='WMSVC'" -ErrorAction SilentlyContinue).StartName
+    if ($wmsvcAccount) {
+        Write-Host "  WMSVC runs as '$wmsvcAccount' - granting it Modify on $WmsvcLogDirectory" -ForegroundColor DarkGray
+        icacls $WmsvcLogDirectory /grant "${wmsvcAccount}:(OI)(CI)M" /T /C | Out-Null
+    }
+
+    $wmsvcKey = 'HKLM:\SOFTWARE\Microsoft\WebManagement\Server'
+    if (-not (Test-Path $wmsvcKey)) {
+        New-Item -Path $wmsvcKey -Force | Out-Null
+    }
+    Set-ItemProperty -Path $wmsvcKey -Name 'EnableRemoteManagement' -Value 1 -Type DWord
+    Set-ItemProperty -Path $wmsvcKey -Name 'LoggingDirectory' -Value $WmsvcLogDirectory -Type String
+
+    $wmsvcService = Get-Service -Name WMSVC -ErrorAction SilentlyContinue
+    if (-not $wmsvcService) {
+        Write-Warning "WMSVC service not found - is the 'Management Service' (Web-Mgmt-Service) role service installed?"
+    }
+    else {
+        Set-Service -Name WMSVC -StartupType Automatic
+        Start-Service -Name WMSVC
+        Write-Host "  WMSVC set to Automatic and started. Logging to $WmsvcLogDirectory" -ForegroundColor Green
     }
 }
-else {
-    Write-Host "  Already exists." -ForegroundColor DarkGray
+
+# ---------------------------------------------------------------------------
+# HTTP.sys parameters: MaxFieldLength / MaxRequestBytes
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Setting HTTP.sys parameters (MaxFieldLength / MaxRequestBytes)" -ForegroundColor Cyan
+$httpParamsKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters'
+if ($PSCmdlet.ShouldProcess($httpParamsKey, 'Set MaxFieldLength / MaxRequestBytes')) {
+    if (-not (Test-Path $httpParamsKey)) {
+        New-Item -Path $httpParamsKey -Force | Out-Null
+    }
+    Set-ItemProperty -Path $httpParamsKey -Name 'MaxFieldLength' -Value 0xfffe -Type DWord
+    Set-ItemProperty -Path $httpParamsKey -Name 'MaxRequestBytes' -Value 0xfffe -Type DWord
+    Write-Host "  MaxFieldLength and MaxRequestBytes set to 0xfffe (65534)." -ForegroundColor Green
+    Write-Warning "HTTP.sys is a kernel-mode driver - these values only take effect after a full server RESTART, not just an IIS/service restart. Reboot when convenient to apply them."
 }
-
-Write-Host "`n==> Granting DOMAIN\DevGroup $devGroupRightsLabel on $ContentsFolder ($Environment)" -ForegroundColor Cyan
-Invoke-Icacls -Description "Set owner to BUILTIN\Administrators on $ContentsFolder (recursive)" `
-    -IcaclsArgs @("`"$ContentsFolder`"", '/setowner', '"BUILTIN\Administrators"', '/T', '/C')
-Invoke-Icacls -Description "Grant DOMAIN\DevGroup $devGroupRightsLabel on $ContentsFolder (recursive)" `
-    -IcaclsArgs @("`"$ContentsFolder`"", '/grant:r', "`"DOMAIN\DevGroup:(OI)(CI)$devGroupRights`"", '/T', '/C')
-
-
-# ---------------------------------------------------------------------------
-# Logs root (covers FailedReqLogFiles too; that folder gets an additional
-# explicit Modify grant for IIS_IUSRS below)
-# ---------------------------------------------------------------------------
-Set-IISPermissions -Path $LogsRoot -Grants @(
-    @{ Trustee = 'SYSTEM';               Rights = 'F'  }
-    @{ Trustee = 'BUILTIN\Administrators'; Rights = 'F'  }
-    @{ Trustee = 'BUILTIN\IIS_IUSRS';    Rights = 'RX' }
-    @{ Trustee = 'DOMAIN\DevGroup';      Rights = 'RX' }
-)
-
-# FailedReqLogFiles is written by the worker process (app pool identity,
-# a member of IIS_IUSRS) - it needs Modify, not just Read & Execute.
-Write-Host "`n==> Granting IIS_IUSRS Modify on $TraceLogs (trace logs are written by worker processes)" -ForegroundColor Cyan
-Invoke-Icacls -Description "Set owner to BUILTIN\Administrators on $TraceLogs (recursive)" `
-    -IcaclsArgs @("`"$TraceLogs`"", '/setowner', '"BUILTIN\Administrators"', '/T', '/C')
-Invoke-Icacls -Description "Grant BUILTIN\IIS_IUSRS Modify on $TraceLogs (recursive)" `
-    -IcaclsArgs @("`"$TraceLogs`"", '/grant:r', '"BUILTIN\IIS_IUSRS:(OI)(CI)M"', '/T', '/C')
 
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
-Write-Host "`n==> Resulting permissions" -ForegroundColor Cyan
-foreach ($p in @($InetpubRoot, $ContentsFolder, $LogsRoot, $TraceLogs)) {
-    Write-Host "`n$p" -ForegroundColor Yellow
-    icacls $p
+Write-Host "`n==> Verification" -ForegroundColor Cyan
+foreach ($site in Get-Website) {
+    $sitePsPath = "IIS:\Sites\$($site.Name)"
+    Write-Host "`n$($site.Name)" -ForegroundColor Yellow
+    [PSCustomObject]@{
+        WindowsAuthEnabled = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath $sitePsPath -Name enabled).Value
+        UseKernelMode      = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath $sitePsPath -Name useKernelMode).Value
+        Providers          = (Get-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers/add' -PSPath $sitePsPath | ForEach-Object { $_.value }) -join ', '
+        AnonymousEnabled   = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' -PSPath $sitePsPath -Name enabled).Value
+        LogTarget          = (Get-ItemProperty -Path $sitePsPath -Name logFile.logTargetW3C).Value
+        DefaultDocsTop3    = ((Get-WebConfiguration -Filter 'system.webServer/defaultDocument/files/add' -PSPath $sitePsPath | Select-Object -First 3 -ExpandProperty value) -join ', ')
+        AspSessionTimeout  = (Get-WebConfigurationProperty -Filter 'system.webServer/asp/session' -PSPath $sitePsPath -Name timeout).Value
+        FrtRulePath        = (Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add" -PSPath $sitePsPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty path)
+        FrtProviders       = ((Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas/add" -PSPath $sitePsPath -ErrorAction SilentlyContinue | ForEach-Object { $_.provider }) -join ', ')
+    } | Format-List
 }
 
-Write-Host "`nDone. ACL backups saved under $BackupFolder (restore with: icacls <path> /restore <backupfile>)." -ForegroundColor Green
+Write-Host "`nWMSVC status:" -ForegroundColor Yellow
+Get-Service -Name WMSVC -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType
 
-# ---------------------------------------------------------------------------
-# Scheduled task: delete log/trace files older than $LogRetentionDays
-# ---------------------------------------------------------------------------
-if ($SkipScheduledTask) {
-    Write-Host "`n-SkipScheduledTask specified - not creating the log-cleanup task." -ForegroundColor Yellow
-}
-else {
-    Write-Host "`n==> Setting up daily log cleanup (retention: $LogRetentionDays days)" -ForegroundColor Cyan
+Write-Host "`nHTTP.sys parameters:" -ForegroundColor Yellow
+Get-ItemProperty -Path $httpParamsKey -ErrorAction SilentlyContinue |
+    Select-Object MaxFieldLength, MaxRequestBytes | Format-List
+Write-Host "(A server restart is required for these to take effect if this is the first time they've been set.)" -ForegroundColor DarkGray
 
-    $scriptsFolder = 'C:\Scripts'
-    New-Item -ItemType Directory -Path $scriptsFolder -Force | Out-Null
-    $cleanupScriptPath = Join-Path $scriptsFolder 'Remove-OldIISLogs.ps1'
+Write-Host "`nPer-site result summary:" -ForegroundColor Yellow
+$siteResults | Format-Table -AutoSize
 
-    # Single-quoted here-string: NO variable interpolation or escape processing
-    # happens here, so the script content below is written to disk exactly as
-    # written - avoiding a whole class of nested-quoting bugs. LogsRoot and
-    # RetentionDays are supplied as real parameters, passed explicitly by the
-    # scheduled task action below (not baked into the file via string
-    # substitution), so this file never needs to be regenerated to change them.
-    $cleanupScriptContent = @'
-<#
-.SYNOPSIS
-    Deletes IIS log and trace files older than the given retention period.
-    Generated by Set-IIS-Permissions.ps1. Safe to run manually; the scheduled
-    task passes -LogsRoot and -RetentionDays explicitly each run.
-#>
-param(
-    [Parameter(Mandatory)][string]$LogsRoot,
-    [Parameter(Mandatory)][int]$RetentionDays,
-    [string]$BackupFolder = 'C:\ACL-Backups'
-)
+Write-Host @"
 
-$ErrorActionPreference = 'Stop'
-New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
-$cutoff  = (Get-Date).AddDays(-$RetentionDays)
-$logPath = Join-Path $BackupFolder ("LogCleanup_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+NOTE on Kerberos (useKernelMode = false): with kernel-mode auth disabled,
+IIS decrypts Kerberos tickets in user mode using either the machine account
+or the application pool identity (controlled by useAppPoolCredentials, left
+at its default of false here - i.e. still the machine account). This works
+out of the box for the common case (default ApplicationPoolIdentity, SPN
+registered to the machine account). If any app pool here runs under a
+custom domain service account with its own SPN, you'll also need to set
+useAppPoolCredentials = true for that site, or Kerberos auth will fail.
+"@ -ForegroundColor DarkGray
 
-$deleted = New-Object System.Collections.Generic.List[string]
-$errors  = New-Object System.Collections.Generic.List[string]
-
-Get-ChildItem -Path $LogsRoot -Recurse -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTime -lt $cutoff } |
-    ForEach-Object {
-        try {
-            Remove-Item -Path $_.FullName -Force -ErrorAction Stop
-            $deleted.Add($_.FullName)
-        }
-        catch {
-            $errors.Add("$($_.FullName): $($_.Exception.Message)")
-        }
-    }
-
-# Clean up any now-empty subfolders left behind (e.g. old per-site W3SVC<id> folders)
-Get-ChildItem -Path $LogsRoot -Recurse -Directory -ErrorAction SilentlyContinue |
-    Sort-Object { $_.FullName.Length } -Descending |
-    Where-Object { -not (Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue) } |
-    Remove-Item -Force -ErrorAction SilentlyContinue
-
-$summary = "{0} - Deleted {1} file(s) older than {2} days from {3}" -f (Get-Date -Format 'u'), $deleted.Count, $RetentionDays, $LogsRoot
-$summary | Out-File -FilePath $logPath -Append
-
-if ($deleted.Count -gt 0) {
-    "Deleted files:" | Out-File -FilePath $logPath -Append
-    $deleted | Out-File -FilePath $logPath -Append
-}
-if ($errors.Count -gt 0) {
-    "Errors:" | Out-File -FilePath $logPath -Append
-    $errors | Out-File -FilePath $logPath -Append
-}
-'@
-
-    Set-Content -Path $cleanupScriptPath -Value $cleanupScriptContent -Encoding UTF8
-    Write-Host "  Cleanup script written to $cleanupScriptPath" -ForegroundColor Green
-
-    $taskName = 'IIS Log Cleanup'
-    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($existingTask) {
-        Write-Host "  Existing scheduled task '$taskName' found - replacing it." -ForegroundColor DarkGray
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    }
-
-    # LogsRoot/RetentionDays/BackupFolder passed explicitly here - the task
-    # is fully self-describing and doesn't depend on defaults baked into the file.
-    $taskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$cleanupScriptPath`" -LogsRoot `"$LogsRoot`" -RetentionDays $LogRetentionDays -BackupFolder `"$BackupFolder`""
-
-    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $taskArgs
-    $trigger   = New-ScheduledTaskTrigger -Daily -At '3:00AM'
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
-
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings `
-        -Description "Deletes IIS log/trace files under $LogsRoot older than $LogRetentionDays days. Runs daily at 3:00 AM as SYSTEM." | Out-Null
-
-    Write-Host "  Scheduled task '$taskName' registered - runs daily at 3:00 AM as SYSTEM." -ForegroundColor Green
-    Write-Host "  Run it on demand with: Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor DarkGray
-}
+Write-Host "`nDone." -ForegroundColor Green
 }
 finally {
     Write-Host "`nTranscript saved to $transcriptPath" -ForegroundColor DarkGray
