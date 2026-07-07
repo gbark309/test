@@ -1,221 +1,336 @@
 <#
 .SYNOPSIS
-    Reverts changes made by Set-IIS-Permissions.ps1: restores NTFS permissions
-    from the ACL backups it saved, removes the DevGroup grant on
-    wwwroot\Contents (not covered by any backup, since that folder was newly
-    created by that script), and removes the "IIS Log Cleanup" scheduled task
-    and its script.
+    Sets correct, locked-down NTFS permissions on the relocated inetpub
+    (D:\inetpub) and logs (E:\Logs) folders for IIS.
 
 .DESCRIPTION
-    For each of the following paths, finds the matching icacls backup file
-    under -BackupFolder and restores it:
-        D:\inetpub
-        D:\inetpub\wwwroot
-        D:\inetpub\custerr   (if a backup exists)
-        D:\inetpub\history   (if a backup exists)
-        E:\Logs
+    Applies the standard Microsoft-recommended IIS permission model:
 
-    By default the MOST RECENT backup found for each path is used
-    independently. If Set-IIS-Permissions.ps1 was only run once, this is
-    exactly the pre-change state. If it was run multiple times, pass
-    -Timestamp to pick one specific run's snapshot consistently across all
-    paths instead (recommended when in doubt - see -ListBackups).
+    D:\inetpub (content root, e.g. wwwroot)
+        SYSTEM               - Full Control   (OI)(CI)
+        Administrators       - Full Control   (OI)(CI)
+        IIS_IUSRS            - Read & Execute (OI)(CI)
+        (all inherited permissions from the volume are stripped first)
 
-    wwwroot\Contents did not exist before Set-IIS-Permissions.ps1 created it,
-    so there is no ACL backup for it. This script instead just removes the
-    DOMAIN\DevGroup grant that was added there (leaving the folder itself and
-    its inherited SYSTEM/Administrators/IIS_IUSRS permissions untouched).
+    E:\Logs\LogFiles (W3C site logs - written by the WWW service as SYSTEM)
+        SYSTEM               - Full Control   (OI)(CI)
+        Administrators       - Full Control   (OI)(CI)
+        IIS_IUSRS            - Read & Execute (OI)(CI)
+
+    E:\Logs\FailedReqLogFiles (trace logs - written by the worker process,
+    i.e. the application pool identity, which is a member of IIS_IUSRS)
+        SYSTEM               - Full Control   (OI)(CI)
+        Administrators       - Full Control   (OI)(CI)
+        IIS_IUSRS            - Modify         (OI)(CI)   <-- needs write access
+
+    Inheritance is disabled (protected) at D:\inetpub and E:\Logs so nothing
+    unexpected is inherited from the volume root, and permissions are then
+    applied recursively (/T) so existing content picks up the same ACEs.
+
+    Before making any changes, current ACLs for both trees are saved to
+    .txt files via icacls /save so they can be restored if needed.
 
 .PARAMETER InetpubRoot
-    Must match the value used when Set-IIS-Permissions.ps1 ran. Default: D:\inetpub
+    Path to the relocated inetpub content root. Default: D:\inetpub
 
 .PARAMETER LogsRoot
-    Must match the value used when Set-IIS-Permissions.ps1 ran. Default: E:\Logs
+    Path to the relocated logs root. Default: E:\Logs
 
 .PARAMETER BackupFolder
-    Where the ACL backups and cleanup script live. Default: C:\ACL-Backups
+    Where to save the pre-change ACL backups. Default: C:\ACL-Backups
 
-.PARAMETER Timestamp
-    Optional. Restore a specific backup run (format: yyyyMMdd_HHmmss) instead
-    of independently picking the latest backup for each path.
+.PARAMETER LogRetentionDays
+    Log/trace files older than this many days are deleted by the scheduled
+    cleanup task. Default: 180 (~6 months).
 
-.PARAMETER ListBackups
-    Lists available backup timestamps per path and exits without changing
-    anything.
-
-.PARAMETER KeepScheduledTask
-    If set, leaves the "IIS Log Cleanup" scheduled task and its script in place.
-
-.PARAMETER KeepDevGroupGrant
-    If set, leaves the DOMAIN\DevGroup grant on wwwroot\Contents in place.
+.PARAMETER SkipScheduledTask
+    If set, skips creating/updating the daily log-cleanup scheduled task.
 
 .NOTES
-    Run elevated. Supports -WhatIf.
+    Run elevated.
 #>
 
 #Requires -RunAsAdministrator
 
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$InetpubRoot  = 'D:\inetpub',
     [string]$LogsRoot     = 'E:\Logs',
     [string]$BackupFolder = 'C:\ACL-Backups',
-    [string]$Timestamp,
-    [switch]$ListBackups,
-    [switch]$KeepScheduledTask,
-    [switch]$KeepDevGroupGrant
+    [int]$LogRetentionDays = 180,
+    [switch]$SkipScheduledTask
 )
 
 $ErrorActionPreference = 'Stop'
 
-if (-not (Test-Path $BackupFolder)) {
-    throw "Backup folder $BackupFolder not found - nothing to revert from."
+$LogFiles  = Join-Path $LogsRoot 'LogFiles'
+$TraceLogs = Join-Path $LogsRoot 'FailedReqLogFiles'
+$Timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+foreach ($p in @($InetpubRoot, $LogsRoot, $LogFiles, $TraceLogs)) {
+    if (-not (Test-Path $p)) {
+        throw "Path not found: $p. Run the relocation script first, or check the parameter values."
+    }
+}
+# Note: wwwroot\Contents is created further down if it doesn't already exist -
+# it is intentionally not required to pre-exist.
+
+New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
+
+$transcriptPath = Join-Path $BackupFolder "Set-IIS-Permissions_$Timestamp.log"
+Start-Transcript -Path $transcriptPath | Out-Null
+Write-Host "Transcript logging to $transcriptPath" -ForegroundColor DarkGray
+
+function Invoke-Icacls {
+    param(
+        [Parameter(Mandatory)][string[]]$IcaclsArgs,
+        [Parameter(Mandatory)][string]$Description
+    )
+    Write-Host "  $Description" -ForegroundColor DarkGray
+    Write-Host "    icacls $($IcaclsArgs -join ' ')" -ForegroundColor DarkGray
+    if ($PSCmdlet.ShouldProcess($Description, 'icacls')) {
+        $proc = Start-Process icacls -ArgumentList $IcaclsArgs -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput "$env:TEMP\icacls_out.txt" -RedirectStandardError "$env:TEMP\icacls_err.txt"
+        if ($proc.ExitCode -ne 0) {
+            Get-Content "$env:TEMP\icacls_err.txt" | Write-Warning
+            throw "icacls failed (exit $($proc.ExitCode)) on: $Description"
+        }
+    }
 }
 
-# Paths that Set-IIS-Permissions.ps1 may have backed up, in restore order
-# (children before/after parent doesn't matter for icacls /restore, but we
-# list root first for readability).
-$pathsToRestore = @(
-    $InetpubRoot,
-    (Join-Path $InetpubRoot 'wwwroot'),
-    (Join-Path $InetpubRoot 'custerr'),
-    (Join-Path $InetpubRoot 'history'),
-    $LogsRoot
+function Set-IISPermissions {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable[]]$Grants,   # @{ Trustee = 'X'; Rights = 'F|M|RX' }
+        [bool]$Recurse = $true
+    )
+
+    Write-Host "`n==> Securing $Path$(if (-not $Recurse) { ' (this folder only, not recursive)' })" -ForegroundColor Cyan
+
+    # 1. Backup current ACL
+    $backupFile = Join-Path $BackupFolder "$($Path -replace '[:\\]', '_')_$Timestamp.txt"
+    Write-Host "  Backing up current ACL to $backupFile" -ForegroundColor DarkGray
+    if ($PSCmdlet.ShouldProcess($backupFile, 'icacls /save')) {
+        $saveArgs = @("`"$Path`"", '/save', "`"$backupFile`"", '/C')
+        if ($Recurse) { $saveArgs += '/T' }
+        Start-Process icacls -ArgumentList $saveArgs -NoNewWindow -Wait | Out-Null
+    }
+
+    # 2. Grant the new trustees FIRST, while the existing (inherited or
+    #    legacy) ACEs are still in place. This is deliberately ordered before
+    #    steps 3/4 below: /grant:r only ADDS an explicit ACE, it never removes
+    #    access, so if this step fails partway (e.g. one trustee name doesn't
+    #    resolve, or icacls hits a transient error), the folder still has
+    #    whatever access it had before this script ran - never zero access.
+    #    -Recurse:$false is used for D:\inetpub itself so this does NOT walk
+    #    into temp\appPools (WAS manages its own per-app-pool isolated ACLs
+    #    there - see note at the call site below).
+    foreach ($g in $Grants) {
+        $grantArgs = @("`"$Path`"", '/grant:r', "`"$($g.Trustee):(OI)(CI)$($g.Rights)`"", '/C')
+        if ($Recurse) { $grantArgs += '/T' }
+        Invoke-Icacls -Description "Grant $($g.Trustee) : $($g.Rights) on $Path$(if ($Recurse) { ' (recursive)' })" `
+            -IcaclsArgs $grantArgs
+    }
+
+    # 3. Only after the new grants are confirmed in place: best-effort strip
+    #    common overly-broad default groups.
+    foreach ($trustee in 'Users', 'Authenticated Users', 'Everyone') {
+        try {
+            Invoke-Icacls -Description "Remove '$trustee' from $Path (if present)" `
+                -IcaclsArgs @("`"$Path`"", '/remove:g', "`"$trustee`"")
+        } catch {
+            Write-Host "    ($trustee not present or already removed - continuing)" -ForegroundColor DarkGray
+        }
+    }
+
+    # 4. Break inheritance last. This only strips INHERITED ACEs - the
+    #    explicit grants from step 2 are untouched, so this is safe even if
+    #    steps 2/3 above encountered partial issues.
+    Invoke-Icacls -Description "Disable inheritance on $Path" `
+        -IcaclsArgs @("`"$Path`"", '/inheritance:r')
+}
+
+# ---------------------------------------------------------------------------
+# inetpub content root
+# ---------------------------------------------------------------------------
+try {
+# IMPORTANT: applied WITHOUT recursion here. D:\inetpub\temp\appPools contains
+# WAS-managed, per-app-pool isolated ACLs (each pool's temp config folder is
+# deliberately protected/non-inheriting so pools can't read each other's
+# config). A blanket recursive grant across the whole tree would stamp
+# IIS_IUSRS/SYSTEM/Administrators onto those folders too, weakening that
+# isolation - this is also what caused WAS to fail to start during this
+# migration previously. Setting the root non-recursively still establishes
+# (OI)(CI) inheritance for anything newly created under it going forward;
+# existing content folders that actually need consistent permissions are
+# handled explicitly, recursively, below.
+Set-IISPermissions -Path $InetpubRoot -Recurse:$false -Grants @(
+    @{ Trustee = 'SYSTEM';               Rights = 'F'  }
+    @{ Trustee = 'BUILTIN\Administrators'; Rights = 'F'  }
+    @{ Trustee = 'BUILTIN\IIS_IUSRS';    Rights = 'RX' }
 )
 
-function Get-BackupPrefix {
-    param([string]$Path)
-    return ($Path -replace '[:\\]', '_')
-}
-
-function Get-BackupFilesFor {
-    param([string]$Path)
-    $prefix = Get-BackupPrefix -Path $Path
-    Get-ChildItem -Path $BackupFolder -Filter "$prefix`_*.txt" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
-}
-
-if ($ListBackups) {
-    Write-Host "==> Available backups in $BackupFolder" -ForegroundColor Cyan
-    foreach ($path in $pathsToRestore) {
-        $files = Get-BackupFilesFor -Path $path
-        Write-Host "`n$path" -ForegroundColor Yellow
-        if ($files) {
-            $files | ForEach-Object { Write-Host "  $($_.Name)  ($($_.LastWriteTime))" }
-        }
-        else {
-            Write-Host "  (no backups found)" -ForegroundColor DarkGray
-        }
+# Recursively normalize permissions on existing content folders only -
+# deliberately excludes temp\appPools (see note above) and the compression
+# cache under temp, both of which IIS/WAS manage themselves.
+foreach ($contentFolder in 'wwwroot', 'custerr', 'history') {
+    $fullPath = Join-Path $InetpubRoot $contentFolder
+    if (Test-Path $fullPath) {
+        Set-IISPermissions -Path $fullPath -Recurse:$true -Grants @(
+            @{ Trustee = 'SYSTEM';               Rights = 'F'  }
+            @{ Trustee = 'BUILTIN\Administrators'; Rights = 'F'  }
+            @{ Trustee = 'BUILTIN\IIS_IUSRS';    Rights = 'RX' }
+        )
     }
-    return
-}
-
-Write-Host "==> Reverting NTFS permissions" -ForegroundColor Cyan
-
-$usedTimestamps = @{}
-
-foreach ($path in $pathsToRestore) {
-    if (-not (Test-Path $path)) {
-        Write-Host "  Skipping $path (does not exist)" -ForegroundColor DarkGray
-        continue
-    }
-
-    $files = Get-BackupFilesFor -Path $path
-    if (-not $files) {
-        Write-Warning "No backup found for $path - skipping (permissions here were not changed by, or backed up by, Set-IIS-Permissions.ps1)."
-        continue
-    }
-
-    if ($Timestamp) {
-        $chosen = $files | Where-Object { $_.Name -like "*_$Timestamp.txt" } | Select-Object -First 1
-        if (-not $chosen) {
-            Write-Warning "No backup for $path matches timestamp $Timestamp - skipping this path."
-            continue
-        }
-    }
-    else {
-        $chosen = $files | Select-Object -First 1
-    }
-
-    $fileTimestamp = $chosen.BaseName -replace '.*_(\d{8}_\d{6})$', '$1'
-    $usedTimestamps[$path] = $fileTimestamp
-
-    Write-Host "  Restoring $path from $($chosen.Name)" -ForegroundColor Yellow
-    if ($PSCmdlet.ShouldProcess($path, "icacls /restore $($chosen.FullName)")) {
-        $proc = Start-Process icacls -ArgumentList @("`"$path`"", '/restore', "`"$($chosen.FullName)`"", '/C') -NoNewWindow -Wait -PassThru
-        if ($proc.ExitCode -ne 0) {
-            Write-Warning "icacls /restore returned exit code $($proc.ExitCode) for $path - verify manually with: icacls `"$path`""
-        }
-        else {
-            Write-Host "    Restored." -ForegroundColor Green
-        }
-    }
-}
-
-if (-not $Timestamp -and ($usedTimestamps.Values | Select-Object -Unique).Count -gt 1) {
-    Write-Warning "Backups restored came from DIFFERENT runs (mixed timestamps below). If Set-IIS-Permissions.ps1 ran more than once, consider re-running this script with -Timestamp to use one consistent snapshot."
-    $usedTimestamps.GetEnumerator() | ForEach-Object { Write-Host "  $($_.Key): $($_.Value)" -ForegroundColor DarkGray }
 }
 
 # ---------------------------------------------------------------------------
-# wwwroot\Contents - no backup exists (folder was newly created), so just
-# remove the DevGroup grant that was added rather than attempting a restore.
+# Contents folder under wwwroot - DevGroup needs Full Control here
+# (inherits SYSTEM/Administrators/IIS_IUSRS from wwwroot above; this just
+# adds an additional explicit grant for DevGroup on top of that)
 # ---------------------------------------------------------------------------
-if (-not $KeepDevGroupGrant) {
-    $contentsFolder = Join-Path $InetpubRoot 'wwwroot\Contents'
-    if (Test-Path $contentsFolder) {
-        Write-Host "`n==> Removing DOMAIN\DevGroup grant on $contentsFolder" -ForegroundColor Cyan
-        if ($PSCmdlet.ShouldProcess($contentsFolder, 'Remove DOMAIN\DevGroup grant')) {
-            $proc = Start-Process icacls -ArgumentList @("`"$contentsFolder`"", '/remove:g', '"DOMAIN\DevGroup"', '/T', '/C') -NoNewWindow -Wait -PassThru
-            if ($proc.ExitCode -eq 0) {
-                Write-Host "  Removed." -ForegroundColor Green
-            }
-            else {
-                Write-Warning "Could not remove the grant automatically (exit $($proc.ExitCode)) - check manually with: icacls `"$contentsFolder`""
-            }
-        }
+$ContentsFolder = Join-Path $InetpubRoot 'wwwroot\Contents'
+
+Write-Host "`n==> Ensuring $ContentsFolder exists" -ForegroundColor Cyan
+if (-not (Test-Path $ContentsFolder)) {
+    if ($PSCmdlet.ShouldProcess($ContentsFolder, 'Create directory')) {
+        New-Item -ItemType Directory -Path $ContentsFolder -Force | Out-Null
     }
 }
 else {
-    Write-Host "`n-KeepDevGroupGrant specified - leaving DOMAIN\DevGroup on wwwroot\Contents." -ForegroundColor Yellow
+    Write-Host "  Already exists." -ForegroundColor DarkGray
 }
 
-# ---------------------------------------------------------------------------
-# Scheduled task + generated cleanup script
-# ---------------------------------------------------------------------------
-if (-not $KeepScheduledTask) {
-    $taskName = 'IIS Log Cleanup'
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task) {
-        Write-Host "`n==> Removing scheduled task '$taskName'" -ForegroundColor Cyan
-        if ($PSCmdlet.ShouldProcess($taskName, 'Unregister scheduled task')) {
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-            Write-Host "  Removed." -ForegroundColor Green
-        }
-    }
+Write-Host "`n==> Granting DOMAIN\DevGroup Full Control on $ContentsFolder" -ForegroundColor Cyan
+Invoke-Icacls -Description "Grant DOMAIN\DevGroup Full Control on $ContentsFolder (recursive)" `
+    -IcaclsArgs @("`"$ContentsFolder`"", '/grant:r', '"DOMAIN\DevGroup:(OI)(CI)F"', '/T', '/C')
 
-    $cleanupScript = 'C:\Scripts\Remove-OldIISLogs.ps1'
-    if (Test-Path $cleanupScript) {
-        Write-Host "==> Removing generated cleanup script $cleanupScript" -ForegroundColor Cyan
-        if ($PSCmdlet.ShouldProcess($cleanupScript, 'Remove file')) {
-            Remove-Item -Path $cleanupScript -Force
-            Write-Host "  Removed." -ForegroundColor Green
-        }
-    }
-}
-else {
-    Write-Host "`n-KeepScheduledTask specified - leaving the scheduled task and cleanup script in place." -ForegroundColor Yellow
-}
+
+# additional explicit Modify grant for IIS_IUSRS below)
+# ---------------------------------------------------------------------------
+Set-IISPermissions -Path $LogsRoot -Grants @(
+    @{ Trustee = 'SYSTEM';               Rights = 'F'  }
+    @{ Trustee = 'BUILTIN\Administrators'; Rights = 'F'  }
+    @{ Trustee = 'BUILTIN\IIS_IUSRS';    Rights = 'RX' }
+    @{ Trustee = 'DOMAIN\DevGroup';      Rights = 'RX' }
+)
+
+# FailedReqLogFiles is written by the worker process (app pool identity,
+# a member of IIS_IUSRS) - it needs Modify, not just Read & Execute.
+Write-Host "`n==> Granting IIS_IUSRS Modify on $TraceLogs (trace logs are written by worker processes)" -ForegroundColor Cyan
+Invoke-Icacls -Description "Grant BUILTIN\IIS_IUSRS Modify on $TraceLogs (recursive)" `
+    -IcaclsArgs @("`"$TraceLogs`"", '/grant:r', '"BUILTIN\IIS_IUSRS:(OI)(CI)M"', '/T', '/C')
 
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Resulting permissions" -ForegroundColor Cyan
-foreach ($path in $pathsToRestore) {
-    if (Test-Path $path) {
-        Write-Host "`n$path" -ForegroundColor Yellow
-        icacls $path
-    }
+foreach ($p in @($InetpubRoot, $ContentsFolder, $LogsRoot, $LogFiles, $TraceLogs)) {
+    Write-Host "`n$p" -ForegroundColor Yellow
+    icacls $p
 }
 
-Write-Host "`nDone." -ForegroundColor Green
+Write-Host "`nDone. ACL backups saved under $BackupFolder (restore with: icacls <path> /restore <backupfile>)." -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# Scheduled task: delete log/trace files older than $LogRetentionDays
+# ---------------------------------------------------------------------------
+if ($SkipScheduledTask) {
+    Write-Host "`n-SkipScheduledTask specified - not creating the log-cleanup task." -ForegroundColor Yellow
+}
+else {
+    Write-Host "`n==> Setting up daily log cleanup (retention: $LogRetentionDays days)" -ForegroundColor Cyan
+
+    $scriptsFolder = 'C:\Scripts'
+    New-Item -ItemType Directory -Path $scriptsFolder -Force | Out-Null
+    $cleanupScriptPath = Join-Path $scriptsFolder 'Remove-OldIISLogs.ps1'
+
+    # Single-quoted here-string: NO variable interpolation or escape processing
+    # happens here, so the script content below is written to disk exactly as
+    # written - avoiding a whole class of nested-quoting bugs. LogsRoot and
+    # RetentionDays are supplied as real parameters, passed explicitly by the
+    # scheduled task action below (not baked into the file via string
+    # substitution), so this file never needs to be regenerated to change them.
+    $cleanupScriptContent = @'
+<#
+.SYNOPSIS
+    Deletes IIS log and trace files older than the given retention period.
+    Generated by Set-IIS-Permissions.ps1. Safe to run manually; the scheduled
+    task passes -LogsRoot and -RetentionDays explicitly each run.
+#>
+param(
+    [Parameter(Mandatory)][string]$LogsRoot,
+    [Parameter(Mandatory)][int]$RetentionDays,
+    [string]$BackupFolder = 'C:\ACL-Backups'
+)
+
+$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
+$cutoff  = (Get-Date).AddDays(-$RetentionDays)
+$logPath = Join-Path $BackupFolder ("LogCleanup_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+
+$deleted = New-Object System.Collections.Generic.List[string]
+$errors  = New-Object System.Collections.Generic.List[string]
+
+Get-ChildItem -Path $LogsRoot -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt $cutoff } |
+    ForEach-Object {
+        try {
+            Remove-Item -Path $_.FullName -Force -ErrorAction Stop
+            $deleted.Add($_.FullName)
+        }
+        catch {
+            $errors.Add("$($_.FullName): $($_.Exception.Message)")
+        }
+    }
+
+# Clean up any now-empty subfolders left behind (e.g. old per-site W3SVC<id> folders)
+Get-ChildItem -Path $LogsRoot -Recurse -Directory -ErrorAction SilentlyContinue |
+    Sort-Object { $_.FullName.Length } -Descending |
+    Where-Object { -not (Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+$summary = "{0} - Deleted {1} file(s) older than {2} days from {3}" -f (Get-Date -Format 'u'), $deleted.Count, $RetentionDays, $LogsRoot
+$summary | Out-File -FilePath $logPath -Append
+
+if ($deleted.Count -gt 0) {
+    "Deleted files:" | Out-File -FilePath $logPath -Append
+    $deleted | Out-File -FilePath $logPath -Append
+}
+if ($errors.Count -gt 0) {
+    "Errors:" | Out-File -FilePath $logPath -Append
+    $errors | Out-File -FilePath $logPath -Append
+}
+'@
+
+    Set-Content -Path $cleanupScriptPath -Value $cleanupScriptContent -Encoding UTF8
+    Write-Host "  Cleanup script written to $cleanupScriptPath" -ForegroundColor Green
+
+    $taskName = 'IIS Log Cleanup'
+    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        Write-Host "  Existing scheduled task '$taskName' found - replacing it." -ForegroundColor DarkGray
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    }
+
+    # LogsRoot/RetentionDays/BackupFolder passed explicitly here - the task
+    # is fully self-describing and doesn't depend on defaults baked into the file.
+    $taskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$cleanupScriptPath`" -LogsRoot `"$LogsRoot`" -RetentionDays $LogRetentionDays -BackupFolder `"$BackupFolder`""
+
+    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $taskArgs
+    $trigger   = New-ScheduledTaskTrigger -Daily -At '3:00AM'
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings `
+        -Description "Deletes IIS log/trace files under $LogsRoot older than $LogRetentionDays days. Runs daily at 3:00 AM as SYSTEM." | Out-Null
+
+    Write-Host "  Scheduled task '$taskName' registered - runs daily at 3:00 AM as SYSTEM." -ForegroundColor Green
+    Write-Host "  Run it on demand with: Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor DarkGray
+}
+}
+finally {
+    Write-Host "`nTranscript saved to $transcriptPath" -ForegroundColor DarkGray
+    Stop-Transcript | Out-Null
+}
