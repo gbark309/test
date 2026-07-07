@@ -1,216 +1,215 @@
 <#
 .SYNOPSIS
-    Reverts changes made by Configure-IIS-Sites.ps1: restores
-    applicationHost.config from its pre-change backup, and restores the
-    WMSVC/HTTP.sys registry values and WMSVC service state to what they were
-    before that script ran.
+    Sets Windows Authentication (Negotiate:Kerberos only, kernel-mode off) as
+    the SERVER-LEVEL default in IIS, so every site - existing and future -
+    inherits it automatically, and disables all other authentication methods.
 
 .DESCRIPTION
-    Configure-IIS-Sites.ps1 saves two files per run under -BackupFolder:
-        applicationHost.config.bak_<timestamp>   - full config backup
-        Configure-IIS-Sites_state_<timestamp>.json - registry/service snapshot
+    Rather than looping through each site and setting an explicit override
+    (which a new site created later would NOT inherit), this script:
 
-    This script uses that pair to fully roll back:
-        1. Stops IIS (so applicationHost.config can be safely replaced)
-        2. Restores applicationHost.config from the backup - this alone
-           reverts every site/server-level IIS config change (authentication,
-           logging, default document, ASP session timeout, FRT rules,
-           siteDefaults)
-        3. Restores WMSVC and HTTP.sys registry values to their prior state -
-           if a value didn't exist before, it's removed rather than merely
-           reset to something else. If an entire key didn't exist before
-           (e.g. WebManagement\Server), the whole key is removed.
-        4. Restores the WMSVC service's StartType and running/stopped state
-        5. Restarts IIS
+    1. Backs up applicationHost.config.
+    2. Removes any existing SITE-LEVEL overrides for authentication sections
+       (windowsAuthentication, anonymousAuthentication, basicAuthentication,
+       digestAuthentication) on every current site, so they fall back to
+       inheriting from the server default instead of a local override.
+    3. Sets the SERVER-LEVEL default (MACHINE/WEBROOT/APPHOST, no location):
+         - windowsAuthentication: enabled = true
+         - useKernelMode = false (required for Negotiate:Kerberos-only - see
+           Microsoft guidance: kernel-mode auth must be off for this provider)
+         - providers: cleared and set to ONLY "Negotiate:Kerberos"
+         - anonymousAuthentication: enabled = false
+         - basicAuthentication / digestAuthentication: enabled = false
+           (skipped gracefully if those role services aren't installed)
+
+    Because this is set once at the server level with no site-level
+    overrides left in place, any site created AFTER this script runs
+    inherits the same Kerberos-only configuration automatically - nothing
+    further to do per new site.
+
+.PARAMETER Revert
+    Restores applicationHost.config from the backup taken by a previous run
+    of this script, undoing everything above. Use -Timestamp to pick a
+    specific prior run; otherwise the most recent backup is used.
 
 .PARAMETER Timestamp
-    Which run to revert (format: yyyyMMdd_HHmmss). If omitted, the most
-    recent state file under -BackupFolder is used automatically.
-
-.PARAMETER BackupFolder
-    Where Configure-IIS-Sites.ps1 saved its backups. Default: C:\Config-Backups
+    Used with -Revert to pick a specific backup (format: yyyyMMdd_HHmmss).
 
 .PARAMETER ListBackups
-    Lists available backup timestamps and exits without changing anything.
+    Lists available backups and exits without changing anything.
 
 .NOTES
     Run elevated. Supports -WhatIf.
-    NOTE: HTTP.sys is a kernel-mode driver - reverting MaxFieldLength /
-    MaxRequestBytes in the registry still requires a full server restart
-    before the reverted values actually take effect.
+
+    OPERATIONAL NOTE: with useKernelMode = false, IIS decrypts Kerberos
+    tickets in user mode using the machine account by default (controlled by
+    useAppPoolCredentials, left at its default of false here). This works for
+    the common case (default ApplicationPoolIdentity, SPN on the machine
+    account). If an app pool runs under a custom domain service account with
+    its own SPN, that site also needs useAppPoolCredentials = true, or
+    Kerberos auth will fail for it specifically.
 #>
 
 #Requires -RunAsAdministrator
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
+    [switch]$Revert,
     [string]$Timestamp,
-    [string]$BackupFolder = 'C:\Config-Backups',
-    [switch]$ListBackups
+    [switch]$ListBackups,
+    [string]$BackupFolder = 'C:\Config-Backups'
 )
 
 $ErrorActionPreference = 'Stop'
+Import-Module WebAdministration
 
-if (-not (Test-Path $BackupFolder)) {
-    throw "Backup folder $BackupFolder not found - nothing to revert from."
-}
+New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
+$ConfigPath = 'C:\Windows\System32\inetsrv\config\applicationHost.config'
 
-$stateFiles = Get-ChildItem -Path $BackupFolder -Filter 'Configure-IIS-Sites_state_*.json' -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending
-
+# ===========================================================================
+# -ListBackups
+# ===========================================================================
 if ($ListBackups) {
-    Write-Host "==> Available Configure-IIS-Sites.ps1 runs in $BackupFolder" -ForegroundColor Cyan
-    if (-not $stateFiles) {
+    Write-Host "==> Available backups in $BackupFolder" -ForegroundColor Cyan
+    $backups = Get-ChildItem -Path $BackupFolder -Filter 'applicationHost.config.authbak_*' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    if (-not $backups) {
         Write-Host "  (none found)" -ForegroundColor DarkGray
     }
-    $stateFiles | ForEach-Object {
+    $backups | ForEach-Object {
         $ts = $_.BaseName -replace '.*_(\d{8}_\d{6})$', '$1'
         Write-Host "  $ts   ($($_.LastWriteTime))"
     }
     return
 }
 
-if (-not $stateFiles) {
-    throw "No 'Configure-IIS-Sites_state_*.json' files found under $BackupFolder. Nothing to revert."
-}
+# ===========================================================================
+# -Revert
+# ===========================================================================
+if ($Revert) {
+    $backups = Get-ChildItem -Path $BackupFolder -Filter 'applicationHost.config.authbak_*' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
 
-if ($Timestamp) {
-    $stateFile = $stateFiles | Where-Object { $_.Name -like "*_$Timestamp.json" } | Select-Object -First 1
-    if (-not $stateFile) {
-        throw "No state file found matching timestamp '$Timestamp'. Run with -ListBackups to see what's available."
-    }
-}
-else {
-    $stateFile = $stateFiles | Select-Object -First 1
-    Write-Host "No -Timestamp specified - using most recent run: $($stateFile.Name)" -ForegroundColor Yellow
-}
-
-$state = Get-Content -Path $stateFile.FullName -Raw | ConvertFrom-Json
-
-if (-not (Test-Path $state.ConfigBackupPath)) {
-    throw "Config backup referenced by this state file is missing: $($state.ConfigBackupPath)"
-}
-
-Write-Host "==> Reverting Configure-IIS-Sites.ps1 run from $($state.Timestamp)" -ForegroundColor Cyan
-Write-Host "  Config backup: $($state.ConfigBackupPath)"
-
-# ---------------------------------------------------------------------------
-# 1. Stop IIS
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Stopping IIS" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('W3SVC, WAS', 'Stop services')) {
-    Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
-    Stop-Service WAS -Force -ErrorAction SilentlyContinue
-}
-
-try {
-    # -----------------------------------------------------------------------
-    # 2. Restore applicationHost.config
-    # -----------------------------------------------------------------------
-    Write-Host "`n==> Restoring applicationHost.config" -ForegroundColor Cyan
-    if ($PSCmdlet.ShouldProcess('applicationHost.config', "Restore from $($state.ConfigBackupPath)")) {
-        Copy-Item -Path $state.ConfigBackupPath -Destination 'C:\Windows\System32\inetsrv\config\applicationHost.config' -Force
-        Write-Host "  Restored." -ForegroundColor Green
+    if (-not $backups) {
+        throw "No backups found under $BackupFolder. Nothing to revert."
     }
 
-    # -----------------------------------------------------------------------
-    # 3. Restore registry values
-    # -----------------------------------------------------------------------
-    Write-Host "`n==> Restoring registry values" -ForegroundColor Cyan
-    $wmsvcKeyPath = 'HKLM:\SOFTWARE\Microsoft\WebManagement\Server'
-    $httpKeyPath  = 'HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters'
-
-    if (-not $state.WmsvcKeyExisted) {
-        Write-Host "  $wmsvcKeyPath did not exist before - removing it entirely" -ForegroundColor DarkGray
-        if ($PSCmdlet.ShouldProcess($wmsvcKeyPath, 'Remove key')) {
-            Remove-Item -Path $wmsvcKeyPath -Recurse -Force -ErrorAction SilentlyContinue
-        }
+    if ($Timestamp) {
+        $backup = $backups | Where-Object { $_.Name -like "*_$Timestamp" } | Select-Object -First 1
+        if (-not $backup) { throw "No backup found matching timestamp '$Timestamp'. Run with -ListBackups to see what's available." }
     }
     else {
-        foreach ($pair in @(
-                @{ Name = 'EnableRemoteManagement'; Value = $state.WmsvcEnableRemoteMgmt; Type = 'DWord' }
-                @{ Name = 'LoggingDirectory';        Value = $state.WmsvcLoggingDirectory; Type = 'String' }
-            )) {
-            if ($null -eq $pair.Value) {
-                Write-Host "  $($pair.Name) did not exist before - removing it" -ForegroundColor DarkGray
-                if ($PSCmdlet.ShouldProcess("$wmsvcKeyPath\$($pair.Name)", 'Remove value')) {
-                    Remove-ItemProperty -Path $wmsvcKeyPath -Name $pair.Name -ErrorAction SilentlyContinue
-                }
-            }
-            else {
-                Write-Host "  Restoring $($pair.Name) = $($pair.Value)" -ForegroundColor DarkGray
-                if ($PSCmdlet.ShouldProcess("$wmsvcKeyPath\$($pair.Name)", 'Restore value')) {
-                    Set-ItemProperty -Path $wmsvcKeyPath -Name $pair.Name -Value $pair.Value -Type $pair.Type
-                }
-            }
-        }
+        $backup = $backups | Select-Object -First 1
+        Write-Host "No -Timestamp specified - using most recent backup: $($backup.Name)" -ForegroundColor Yellow
     }
 
-    if (-not $state.HttpKeyExisted) {
-        Write-Host "  $httpKeyPath did not exist before - removing it entirely" -ForegroundColor DarkGray
-        if ($PSCmdlet.ShouldProcess($httpKeyPath, 'Remove key')) {
-            Remove-Item -Path $httpKeyPath -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-    else {
-        foreach ($pair in @(
-                @{ Name = 'MaxFieldLength';  Value = $state.HttpMaxFieldLength }
-                @{ Name = 'MaxRequestBytes'; Value = $state.HttpMaxRequestBytes }
-            )) {
-            if ($null -eq $pair.Value) {
-                Write-Host "  $($pair.Name) did not exist before - removing it" -ForegroundColor DarkGray
-                if ($PSCmdlet.ShouldProcess("$httpKeyPath\$($pair.Name)", 'Remove value')) {
-                    Remove-ItemProperty -Path $httpKeyPath -Name $pair.Name -ErrorAction SilentlyContinue
-                }
-            }
-            else {
-                Write-Host "  Restoring $($pair.Name) = $($pair.Value)" -ForegroundColor DarkGray
-                if ($PSCmdlet.ShouldProcess("$httpKeyPath\$($pair.Name)", 'Restore value')) {
-                    Set-ItemProperty -Path $httpKeyPath -Name $pair.Name -Value ([int]$pair.Value) -Type DWord
-                }
-            }
-        }
-    }
-    Write-Warning "HTTP.sys is a kernel-mode driver - a full server restart is required before the reverted MaxFieldLength/MaxRequestBytes values actually take effect."
+    Write-Host "==> Reverting authentication configuration from $($backup.Name)" -ForegroundColor Cyan
 
-    # -----------------------------------------------------------------------
-    # 4. Restore WMSVC service state
-    # -----------------------------------------------------------------------
-    Write-Host "`n==> Restoring WMSVC service state" -ForegroundColor Cyan
-    if ($state.WmsvcServiceExisted -and (Get-Service -Name WMSVC -ErrorAction SilentlyContinue)) {
-        if ($PSCmdlet.ShouldProcess('WMSVC', "Set StartType=$($state.WmsvcStartType), Running=$($state.WmsvcWasRunning)")) {
-            Set-Service -Name WMSVC -StartupType $state.WmsvcStartType
-            if ($state.WmsvcWasRunning) {
-                Start-Service -Name WMSVC -ErrorAction SilentlyContinue
-            }
-            else {
-                Stop-Service -Name WMSVC -Force -ErrorAction SilentlyContinue
-            }
-            Write-Host "  WMSVC StartType restored to $($state.WmsvcStartType); running=$($state.WmsvcWasRunning)" -ForegroundColor Green
+    if ($PSCmdlet.ShouldProcess('W3SVC, WAS', 'Stop services')) {
+        Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
+        Stop-Service WAS -Force -ErrorAction SilentlyContinue
+    }
+
+    try {
+        if ($PSCmdlet.ShouldProcess('applicationHost.config', "Restore from $($backup.FullName)")) {
+            Copy-Item -Path $backup.FullName -Destination $ConfigPath -Force
+            Write-Host "  Restored." -ForegroundColor Green
         }
     }
-    else {
-        Write-Host "  WMSVC service was not present before, or is not present now - nothing to restore." -ForegroundColor DarkGray
+    finally {
+        Start-Service WAS -ErrorAction SilentlyContinue
+        Start-Service W3SVC -ErrorAction SilentlyContinue
     }
+
+    Write-Host "`nDone. Re-run without -Revert to verify current settings." -ForegroundColor Green
+    return
 }
-finally {
-    # -----------------------------------------------------------------------
-    # 5. Restart IIS
-    # -----------------------------------------------------------------------
-    Write-Host "`n==> Restarting IIS" -ForegroundColor Cyan
-    Start-Service WAS -ErrorAction SilentlyContinue
-    Start-Service W3SVC -ErrorAction SilentlyContinue
+
+# ===========================================================================
+# Apply configuration
+# ===========================================================================
+$RunTimestamp     = Get-Date -Format 'yyyyMMdd_HHmmss'
+$BackupConfigPath = Join-Path $BackupFolder "applicationHost.config.authbak_$RunTimestamp"
+
+Write-Host "==> Backing up applicationHost.config to $BackupConfigPath" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess($BackupConfigPath, 'Copy applicationHost.config')) {
+    Copy-Item $ConfigPath $BackupConfigPath
+}
+
+$authSections = @(
+    'system.webServer/security/authentication/windowsAuthentication',
+    'system.webServer/security/authentication/anonymousAuthentication',
+    'system.webServer/security/authentication/basicAuthentication',
+    'system.webServer/security/authentication/digestAuthentication'
+)
+
+# ---------------------------------------------------------------------------
+# 1. Remove any per-site overrides so every site falls back to the server
+#    default set below, instead of keeping a stale local value.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Removing site-level authentication overrides (so all sites inherit the server default)" -ForegroundColor Cyan
+foreach ($site in Get-Website) {
+    $sitePsPath = "IIS:\Sites\$($site.Name)"
+    Write-Host "  $($site.Name)" -ForegroundColor DarkGray
+    foreach ($section in $authSections) {
+        try {
+            Clear-WebConfiguration -Filter $section -PSPath $sitePsPath -ErrorAction Stop
+        }
+        catch {
+            # No local override present (already inheriting), or section not
+            # applicable (e.g. Basic/Digest role service not installed) -
+            # either way, nothing to do.
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
-# Verification
+# 2. Set the server-level default that every site (present and future)
+#    inherits unless something re-overrides it at the site level later.
 # ---------------------------------------------------------------------------
-Write-Host "`n==> Verification" -ForegroundColor Cyan
-foreach ($svcName in 'WAS', 'W3SVC', 'WMSVC') {
-    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    if ($svc) {
-        Write-Host "  $svcName : $($svc.Status), StartType=$($svc.StartType)"
+Write-Host "`n==> Setting server-level Windows Authentication default (Negotiate:Kerberos only)" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set authentication defaults')) {
+    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' `
+        -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
+    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' `
+        -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'useKernelMode' -Value $false
+
+    Clear-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -PSPath 'MACHINE/WEBROOT/APPHOST'
+    Add-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' `
+        -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{value = 'Negotiate:Kerberos' }
+
+    Write-Host "  Disabling Anonymous / Basic / Digest authentication (server-level default)" -ForegroundColor DarkGray
+    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' `
+        -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $false
+
+    foreach ($authSection in 'basicAuthentication', 'digestAuthentication') {
+        try {
+            Set-WebConfigurationProperty -Filter "system.webServer/security/authentication/$authSection" `
+                -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $false -ErrorAction Stop
+        }
+        catch {
+            Write-Host "    ($authSection section not present - role service not installed, nothing to disable)" -ForegroundColor DarkGray
+        }
     }
 }
 
-Write-Host "`nDone. Sites/server config restored from $($state.ConfigBackupPath)." -ForegroundColor Green
+# ---------------------------------------------------------------------------
+# Verification - shows the EFFECTIVE (inherited) value per site, confirming
+# they're picking up the server default rather than a stale local override.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Verification (effective values per site)" -ForegroundColor Cyan
+foreach ($site in Get-Website) {
+    $sitePsPath = "IIS:\Sites\$($site.Name)"
+    [PSCustomObject]@{
+        Site               = $site.Name
+        WindowsAuthEnabled = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath $sitePsPath -Name enabled).Value
+        UseKernelMode      = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath $sitePsPath -Name useKernelMode).Value
+        Providers          = (Get-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers/add' -PSPath $sitePsPath | ForEach-Object { $_.value }) -join ', '
+        AnonymousEnabled   = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' -PSPath $sitePsPath -Name enabled).Value
+    }
+} | Format-Table -AutoSize
+
+Write-Host "Backup saved to $BackupConfigPath - revert with:" -ForegroundColor DarkGray
+Write-Host "  .\$($MyInvocation.MyCommand.Name) -Revert -Timestamp $RunTimestamp" -ForegroundColor DarkGray
+
+Write-Host "`nDone." -ForegroundColor Green
