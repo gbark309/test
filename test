@@ -9,11 +9,8 @@
     (which a new site created later would NOT inherit), this script:
 
     1. Backs up applicationHost.config.
-    2. Removes any existing SITE-LEVEL overrides for authentication sections
-       (windowsAuthentication, anonymousAuthentication, basicAuthentication,
-       digestAuthentication) on every current site, so they fall back to
-       inheriting from the server default instead of a local override.
-    3. Sets the SERVER-LEVEL default (MACHINE/WEBROOT/APPHOST, no location):
+    2. Sets the SERVER-LEVEL default FIRST (MACHINE/WEBROOT/APPHOST, no
+       location):
          - windowsAuthentication: enabled = true
          - useKernelMode = false (required for Negotiate:Kerberos-only - see
            Microsoft guidance: kernel-mode auth must be off for this provider)
@@ -21,6 +18,13 @@
          - anonymousAuthentication: enabled = false
          - basicAuthentication / digestAuthentication: enabled = false
            (skipped gracefully if those role services aren't installed)
+    3. THEN removes any existing SITE-LEVEL overrides for the same
+       authentication sections on every current site, so they fall back to
+       inheriting the server default set in step 2 instead of a stale local
+       override. Doing this after step 2 (not before) means that if this
+       step fails partway through, every site still has either its original
+       config or the new good default - never a moment with no auth config
+       at all falling back to IIS's raw (less secure) schema defaults.
 
     Because this is set once at the server level with no site-level
     overrides left in place, any site created AFTER this script runs
@@ -66,13 +70,24 @@ Import-Module WebAdministration
 New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
 $ConfigPath = 'C:\Windows\System32\inetsrv\config\applicationHost.config'
 
+function Test-ConfigXmlValid {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        [xml](Get-Content -Path $Path -Raw) | Out-Null
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 # ===========================================================================
 # -ListBackups
 # ===========================================================================
 if ($ListBackups) {
     Write-Host "==> Available backups in $BackupFolder" -ForegroundColor Cyan
-    $backups = Get-ChildItem -Path $BackupFolder -Filter 'applicationHost.config.authbak_*' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
+    $backups = Get-ChildItem -Path $BackupFolder -Filter 'applicationHost.config.authbak_*' -ErrorAction SilentlyContinue
+    $backups = $backups | Sort-Object LastWriteTime -Descending
     if (-not $backups) {
         Write-Host "  (none found)" -ForegroundColor DarkGray
     }
@@ -87,8 +102,8 @@ if ($ListBackups) {
 # -Revert
 # ===========================================================================
 if ($Revert) {
-    $backups = Get-ChildItem -Path $BackupFolder -Filter 'applicationHost.config.authbak_*' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
+    $backups = Get-ChildItem -Path $BackupFolder -Filter 'applicationHost.config.authbak_*' -ErrorAction SilentlyContinue
+    $backups = $backups | Sort-Object LastWriteTime -Descending
 
     if (-not $backups) {
         throw "No backups found under $BackupFolder. Nothing to revert."
@@ -104,6 +119,10 @@ if ($Revert) {
     }
 
     Write-Host "==> Reverting authentication configuration from $($backup.Name)" -ForegroundColor Cyan
+
+    if (-not (Test-ConfigXmlValid -Path $backup.FullName)) {
+        throw "Backup file $($backup.FullName) is not well-formed XML - refusing to restore a corrupted config. Check other available backups with -ListBackups."
+    }
 
     if ($PSCmdlet.ShouldProcess('W3SVC, WAS', 'Stop services')) {
         Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
@@ -130,6 +149,15 @@ if ($Revert) {
 # ===========================================================================
 $RunTimestamp     = Get-Date -Format 'yyyyMMdd_HHmmss'
 $BackupConfigPath = Join-Path $BackupFolder "applicationHost.config.authbak_$RunTimestamp"
+$TranscriptPath   = Join-Path $BackupFolder "Set-IIS-WindowsAuthentication_$RunTimestamp.log"
+Start-Transcript -Path $TranscriptPath | Out-Null
+
+try {
+
+$winAuthFeature = Get-WindowsFeature -Name Web-Windows-Auth -ErrorAction SilentlyContinue
+if ($winAuthFeature -and -not $winAuthFeature.Installed) {
+    throw "The Windows Authentication role service (Web-Windows-Auth) is not installed. Install it first: Install-WindowsFeature Web-Windows-Auth"
+}
 
 Write-Host "==> Backing up applicationHost.config to $BackupConfigPath" -ForegroundColor Cyan
 if ($PSCmdlet.ShouldProcess($BackupConfigPath, 'Copy applicationHost.config')) {
@@ -144,51 +172,53 @@ $authSections = @(
 )
 
 # ---------------------------------------------------------------------------
-# 1. Remove any per-site overrides so every site falls back to the server
-#    default set below, instead of keeping a stale local value.
+# 1. Set the server-level default FIRST. If step 2 (clearing per-site
+#    overrides) fails partway, sites not yet touched still have their old
+#    explicit config, and sites already cleared correctly inherit this good
+#    default - rather than momentarily falling back to IIS's raw schema
+#    defaults (anonymous ON, Windows auth OFF), which is what would happen
+#    if the clearing ran first and this step then failed.
 # ---------------------------------------------------------------------------
-Write-Host "`n==> Removing site-level authentication overrides (so all sites inherit the server default)" -ForegroundColor Cyan
-foreach ($site in Get-Website) {
-    $sitePsPath = "IIS:\Sites\$($site.Name)"
-    Write-Host "  $($site.Name)" -ForegroundColor DarkGray
-    foreach ($section in $authSections) {
+Write-Host "`n==> Setting server-level Windows Authentication default (Negotiate:Kerberos only)" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set authentication defaults')) {
+    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
+    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'useKernelMode' -Value $false
+
+    Clear-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -PSPath 'MACHINE/WEBROOT/APPHOST'
+    Add-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{value = 'Negotiate:Kerberos' }
+
+    Write-Host "  Disabling Anonymous / Basic / Digest authentication (server-level default)" -ForegroundColor DarkGray
+    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $false
+
+    foreach ($authSection in 'basicAuthentication', 'digestAuthentication') {
         try {
-            Clear-WebConfiguration -Filter $section -PSPath $sitePsPath -ErrorAction Stop
+            Set-WebConfigurationProperty -Filter "system.webServer/security/authentication/$authSection" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $false -ErrorAction Stop
         }
         catch {
-            # No local override present (already inheriting), or section not
-            # applicable (e.g. Basic/Digest role service not installed) -
-            # either way, nothing to do.
+            Write-Host "    ($authSection section not present - role service not installed, nothing to disable)" -ForegroundColor DarkGray
         }
     }
 }
 
 # ---------------------------------------------------------------------------
-# 2. Set the server-level default that every site (present and future)
-#    inherits unless something re-overrides it at the site level later.
+# 2. Remove any per-site overrides so every site falls back to the server
+#    default set above, instead of keeping a stale local value.
 # ---------------------------------------------------------------------------
-Write-Host "`n==> Setting server-level Windows Authentication default (Negotiate:Kerberos only)" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set authentication defaults')) {
-    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' `
-        -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
-    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' `
-        -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'useKernelMode' -Value $false
-
-    Clear-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -PSPath 'MACHINE/WEBROOT/APPHOST'
-    Add-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' `
-        -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{value = 'Negotiate:Kerberos' }
-
-    Write-Host "  Disabling Anonymous / Basic / Digest authentication (server-level default)" -ForegroundColor DarkGray
-    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' `
-        -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $false
-
-    foreach ($authSection in 'basicAuthentication', 'digestAuthentication') {
+Write-Host "`n==> Removing site-level authentication overrides (so all sites inherit the server default)" -ForegroundColor Cyan
+foreach ($site in Get-Website) {
+    $sitePsPath = "IIS:\Sites\$($site.Name)"
+    Write-Host "  $($site.Name)" -ForegroundColor DarkGray
+    if (-not $PSCmdlet.ShouldProcess($site.Name, 'Clear site-level authentication overrides')) { continue }
+    foreach ($section in $authSections) {
         try {
-            Set-WebConfigurationProperty -Filter "system.webServer/security/authentication/$authSection" `
-                -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $false -ErrorAction Stop
+            Clear-WebConfiguration -Filter $section -PSPath $sitePsPath -ErrorAction Stop
         }
         catch {
-            Write-Host "    ($authSection section not present - role service not installed, nothing to disable)" -ForegroundColor DarkGray
+            # Expected in the common case: no local override present (already
+            # inheriting), or section not applicable (e.g. Basic/Digest role
+            # service not installed). Logged (not fully silent) so a genuine
+            # unexpected failure is still visible in the transcript.
+            Write-Host "    ($section : nothing to clear - $($_.Exception.Message))" -ForegroundColor DarkGray
         }
     }
 }
@@ -198,7 +228,7 @@ if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set authentication defau
 # they're picking up the server default rather than a stale local override.
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Verification (effective values per site)" -ForegroundColor Cyan
-foreach ($site in Get-Website) {
+$verificationRows = foreach ($site in Get-Website) {
     $sitePsPath = "IIS:\Sites\$($site.Name)"
     [PSCustomObject]@{
         Site               = $site.Name
@@ -207,9 +237,16 @@ foreach ($site in Get-Website) {
         Providers          = (Get-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers/add' -PSPath $sitePsPath | ForEach-Object { $_.value }) -join ', '
         AnonymousEnabled   = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' -PSPath $sitePsPath -Name enabled).Value
     }
-} | Format-Table -AutoSize
+}
+$verificationRows | Format-Table -AutoSize
 
 Write-Host "Backup saved to $BackupConfigPath - revert with:" -ForegroundColor DarkGray
 Write-Host "  .\$($MyInvocation.MyCommand.Name) -Revert -Timestamp $RunTimestamp" -ForegroundColor DarkGray
 
 Write-Host "`nDone." -ForegroundColor Green
+
+}
+finally {
+    Write-Host "`nTranscript saved to $TranscriptPath" -ForegroundColor DarkGray
+    Stop-Transcript | Out-Null
+}
