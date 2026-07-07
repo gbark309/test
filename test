@@ -51,6 +51,10 @@
 .PARAMETER SkipScheduledTask
     If set, skips creating/updating the daily log-cleanup scheduled task.
 
+.PARAMETER Environment
+    Required. 'dev' grants DOMAIN\DevGroup Full Control on
+    wwwroot\Contents; 'prod' grants DOMAIN\DevGroup Read & Execute only.
+
 .NOTES
     Run elevated.
 #>
@@ -63,7 +67,11 @@ param(
     [string]$LogsRoot     = 'E:\Logs',
     [string]$BackupFolder = 'C:\ACL-Backups',
     [int]$LogRetentionDays = 180,
-    [switch]$SkipScheduledTask
+    [switch]$SkipScheduledTask,
+
+    [Parameter(Mandatory)]
+    [ValidateSet('dev', 'prod')]
+    [string]$Environment
 )
 
 $ErrorActionPreference = 'Stop'
@@ -211,11 +219,15 @@ foreach ($contentFolder in 'wwwroot', 'custerr', 'history') {
 }
 
 # ---------------------------------------------------------------------------
-# Contents folder under wwwroot - DevGroup needs Full Control here
+# Contents folder under wwwroot - DevGroup's rights here depend on -Environment:
+#   dev  -> Full Control (developers can deploy/modify content directly)
+#   prod -> Read & Execute only (no direct write access in production)
 # (inherits SYSTEM/Administrators/IIS_IUSRS from wwwroot above; this just
 # adds an additional explicit grant for DevGroup on top of that)
 # ---------------------------------------------------------------------------
 $ContentsFolder = Join-Path $InetpubRoot 'wwwroot\Contents'
+$devGroupRights = if ($Environment -eq 'dev') { 'F' } else { 'RX' }
+$devGroupRightsLabel = if ($Environment -eq 'dev') { 'Full Control' } else { 'Read & Execute' }
 
 Write-Host "`n==> Ensuring $ContentsFolder exists" -ForegroundColor Cyan
 if (-not (Test-Path $ContentsFolder)) {
@@ -227,14 +239,16 @@ else {
     Write-Host "  Already exists." -ForegroundColor DarkGray
 }
 
-Write-Host "`n==> Granting DOMAIN\DevGroup Full Control on $ContentsFolder" -ForegroundColor Cyan
+Write-Host "`n==> Granting DOMAIN\DevGroup $devGroupRightsLabel on $ContentsFolder ($Environment)" -ForegroundColor Cyan
 Invoke-Icacls -Description "Set owner to BUILTIN\Administrators on $ContentsFolder (recursive)" `
     -IcaclsArgs @("`"$ContentsFolder`"", '/setowner', '"BUILTIN\Administrators"', '/T', '/C')
-Invoke-Icacls -Description "Grant DOMAIN\DevGroup Full Control on $ContentsFolder (recursive)" `
-    -IcaclsArgs @("`"$ContentsFolder`"", '/grant:r', '"DOMAIN\DevGroup:(OI)(CI)F"', '/T', '/C')
+Invoke-Icacls -Description "Grant DOMAIN\DevGroup $devGroupRightsLabel on $ContentsFolder (recursive)" `
+    -IcaclsArgs @("`"$ContentsFolder`"", '/grant:r', "`"DOMAIN\DevGroup:(OI)(CI)$devGroupRights`"", '/T', '/C')
 
 
-# additional explicit Modify grant for IIS_IUSRS below)
+# ---------------------------------------------------------------------------
+# Logs root (covers FailedReqLogFiles too; that folder gets an additional
+# explicit Modify grant for IIS_IUSRS below)
 # ---------------------------------------------------------------------------
 Set-IISPermissions -Path $LogsRoot -Grants @(
     @{ Trustee = 'SYSTEM';               Rights = 'F'  }
