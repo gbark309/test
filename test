@@ -4,19 +4,25 @@
     Tracing (trace) logs to E:\Logs.
 
 .DESCRIPTION
-    - Stops IIS services.
+    - Stops IIS services once, performs all file/config changes, then always
+      restarts IIS in a finally block - even if the script errors out partway
+      through - so the server is never left down indefinitely.
     - Backs up applicationHost.config before making changes.
     - Robocopies C:\inetpub content (excluding the logs folder) to D:\inetpub.
-    - Moves C:\inetpub\logs\LogFiles       -> E:\Logs\LogFiles
+    - Moves C:\inetpub\logs\LogFiles          -> E:\Logs\LogFiles
       Moves C:\inetpub\logs\FailedReqLogFiles -> E:\Logs\FailedReqLogFiles
     - Updates the registry PathWWWRoot default.
     - Updates applicationHost.config:
-        * siteDefaults logFile.directory
-        * siteDefaults traceFailedRequestsLogging.directory
-        * Every existing site's physicalPath (C:\inetpub\... -> D:\inetpub\...)
-        * Every existing site's logFile.directory / traceFailedRequestsLogging.directory
-        * Every application / virtual directory physicalPath under each site
-    - Restarts IIS services and prints a verification report.
+        * server-wide custom error page path (httpErrors prefixLanguageFilePath)
+        * siteDefaults logFile.directory / traceFailedRequestsLogging.directory
+        * every existing site's physicalPath (old root -> new root)
+        * every existing site's logFile.directory / traceFailedRequestsLogging.directory
+        * every application / virtual directory physicalPath under each site
+    - Verifies the move succeeded, then removes the old inetpub content while
+      IIS is still stopped (no lock/ownership conflicts), with a layered
+      fallback (ACL repair -> robocopy purge -> SYSTEM-context task) if
+      anything is still stubborn.
+    - Restarts IIS and prints a final verification report.
 
 .PARAMETER NewInetpubRoot
     Target root for inetpub content. Default: D:\inetpub
@@ -25,166 +31,112 @@
     Target root for logs and trace logs. Default: E:\Logs
     Creates E:\Logs\LogFiles and E:\Logs\FailedReqLogFiles under it.
 
-.PARAMETER WhatIf
-    Shows what would happen without making changes.
+.PARAMETER BackupFolder
+    Where to save the applicationHost.config backup. Default: C:\Config-Backups
+
+.PARAMETER SkipCleanup
+    If set, leaves the old inetpub content in place after verifying the move,
+    instead of deleting it. Useful for a first cautious run.
 
 .NOTES
-    Run elevated. This causes IIS downtime while services are stopped -
-    run during a maintenance window.
+    Run elevated. Causes IIS downtime for the duration of the move - run
+    during a maintenance window. Supports -WhatIf.
 #>
 
 #Requires -RunAsAdministrator
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
+    [ValidateNotNullOrEmpty()]
     [string]$NewInetpubRoot = 'D:\inetpub',
-    [string]$LogsRoot       = 'E:\Logs'
+
+    [ValidateNotNullOrEmpty()]
+    [string]$LogsRoot = 'E:\Logs',
+
+    [ValidateNotNullOrEmpty()]
+    [string]$BackupFolder = 'C:\Config-Backups',
+
+    [switch]$SkipCleanup
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module WebAdministration
+
+# ---------------------------------------------------------------------------
+# Shared paths / constants
+# ---------------------------------------------------------------------------
 $OldInetpubRoot   = "$($env:SystemDrive)\inetpub"
 $LogFilesTarget   = Join-Path $LogsRoot 'LogFiles'
 $TraceLogsTarget  = Join-Path $LogsRoot 'FailedReqLogFiles'
 $OldLogsFolder    = Join-Path $OldInetpubRoot 'logs'
 $OldLogFiles      = Join-Path $OldLogsFolder 'LogFiles'
 $OldTraceLogs     = Join-Path $OldLogsFolder 'FailedReqLogFiles'
-$BackupConfigPath = "C:\Windows\System32\inetsrv\config\applicationHost.config.bak_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+$NewCusterrPath   = Join-Path $NewInetpubRoot 'custerr'
+$Timestamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
+$BackupConfigPath = Join-Path $BackupFolder "applicationHost.config.bak_$Timestamp"
+$TranscriptPath   = Join-Path $BackupFolder "Move-Inetpub-Logs_$Timestamp.log"
 
-Import-Module WebAdministration
-
-function Test-DriveExists {
-    param([string]$Path)
-    $drive = (Split-Path -Qualifier $Path).TrimEnd(':')
-    if (-not (Get-PSDrive -Name $drive -ErrorAction SilentlyContinue)) {
-        throw "Drive $drive`: does not exist or is not ready. Attach/format the disk first."
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+function Test-DriveReady {
+    param([Parameter(Mandatory)][string]$Path)
+    $driveLetter = (Split-Path -Qualifier $Path).TrimEnd(':')
+    $drive = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
+    if (-not $drive) {
+        throw "Drive $driveLetter`: does not exist or is not ready. Attach/format the disk first."
     }
 }
 
-Write-Host "==> Pre-flight checks" -ForegroundColor Cyan
-Test-DriveExists -Path $NewInetpubRoot
-Test-DriveExists -Path $LogsRoot
-
-if (-not (Get-Website)) {
-    Write-Warning "No IIS sites found via Get-Website - is IIS installed?"
-}
-
-# ---------------------------------------------------------------------------
-# 1. Stop IIS
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Stopping IIS services" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('W3SVC, WAS', 'Stop services')) {
-    Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
-    Stop-Service WAS   -Force -ErrorAction SilentlyContinue
-}
-
-# ---------------------------------------------------------------------------
-# 2. Backup applicationHost.config
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Backing up applicationHost.config to $BackupConfigPath" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess($BackupConfigPath, 'Copy applicationHost.config')) {
-    Copy-Item 'C:\Windows\System32\inetsrv\config\applicationHost.config' $BackupConfigPath
-}
-
-# ---------------------------------------------------------------------------
-# 3. Create target folders
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Creating target folders" -ForegroundColor Cyan
-foreach ($p in @($NewInetpubRoot, $LogFilesTarget, $TraceLogsTarget)) {
-    if ($PSCmdlet.ShouldProcess($p, 'Create directory')) {
-        New-Item -ItemType Directory -Path $p -Force | Out-Null
-    }
-}
-
-# ---------------------------------------------------------------------------
-# 4. Robocopy inetpub content (excluding the logs folder) to new root
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Copying $OldInetpubRoot -> $NewInetpubRoot (excluding logs)" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess("$OldInetpubRoot -> $NewInetpubRoot", 'Robocopy mirror')) {
-    $robocopyArgs = @(
-        "`"$OldInetpubRoot`"", "`"$NewInetpubRoot`"",
-        '/MIR', '/COPYALL', '/DCOPY:DAT',
-        '/XD', "`"$OldLogsFolder`"",
-        '/R:2', '/W:5', '/NFL', '/NDL', '/NP'
+function Invoke-Robocopy {
+    <#
+        Thin wrapper around robocopy.exe with consistent exit-code handling.
+        Robocopy exit codes 0-7 are informational success; 8+ is a real failure.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string[]]$Options,
+        [switch]$AllowFailure
     )
-    $proc = Start-Process robocopy -ArgumentList $robocopyArgs -NoNewWindow -Wait -PassThru
-    # Robocopy exit codes 0-7 are success/informational; 8+ indicates real errors.
-    if ($proc.ExitCode -ge 8) {
-        throw "Robocopy failed with exit code $($proc.ExitCode). Aborting before touching config."
+    $args = @("`"$Source`"", "`"$Destination`"") + $Options
+    $proc = Start-Process robocopy -ArgumentList $args -NoNewWindow -Wait -PassThru
+    if ($proc.ExitCode -ge 8 -and -not $AllowFailure) {
+        throw "Robocopy failed (exit $($proc.ExitCode)) copying '$Source' -> '$Destination'."
     }
-    Write-Host "Robocopy completed with exit code $($proc.ExitCode) (0-7 = success)." -ForegroundColor Green
+    return $proc.ExitCode
 }
 
-# ---------------------------------------------------------------------------
-# 5. Move existing logs / trace logs to E:\Logs
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Moving existing log data to $LogsRoot" -ForegroundColor Cyan
-foreach ($pair in @(
-        @{ Src = $OldLogFiles;  Dst = $LogFilesTarget },
-        @{ Src = $OldTraceLogs; Dst = $TraceLogsTarget }
-    )) {
-    if (Test-Path $pair.Src) {
-        if ($PSCmdlet.ShouldProcess("$($pair.Src) -> $($pair.Dst)", 'Move log data')) {
-            $robocopyArgs = @("`"$($pair.Src)`"", "`"$($pair.Dst)`"", '/E', '/MOVE', '/R:2', '/W:5', '/NFL', '/NDL', '/NP')
-            Start-Process robocopy -ArgumentList $robocopyArgs -NoNewWindow -Wait | Out-Null
-        }
-    }
-    else {
-        Write-Host "  (no existing data at $($pair.Src), skipping)" -ForegroundColor DarkGray
-    }
+function Stop-IISServices {
+    Write-Verbose "Stopping IIS services and worker processes"
+    Get-Process w3wp -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
+    Stop-Service WAS -Force -ErrorAction SilentlyContinue
 }
 
-# ---------------------------------------------------------------------------
-# 6. Registry: default wwwroot path used by IIS tooling
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Updating registry PathWWWRoot" -ForegroundColor Cyan
-$inetStpKey = 'HKLM:\SOFTWARE\Microsoft\InetStp'
-if ($PSCmdlet.ShouldProcess($inetStpKey, 'Set PathWWWRoot')) {
-    Set-ItemProperty -Path $inetStpKey -Name 'PathWWWRoot' -Value (Join-Path $NewInetpubRoot 'wwwroot')
+function Start-IISServices {
+    Write-Verbose "Starting IIS services"
+    Start-Service WAS -ErrorAction SilentlyContinue
+    Start-Service W3SVC -ErrorAction SilentlyContinue
 }
 
-# ---------------------------------------------------------------------------
-# 7. Update applicationHost.config - site defaults for logs/trace logs
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Relocating custom error page path (httpErrors) off the old inetpub root" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST (httpErrors)', 'Repoint prefixLanguageFilePath')) {
-    $NewCusterrPath = Join-Path $NewInetpubRoot 'custerr'
-    $errorEntries = Get-WebConfiguration '/system.webServer/httpErrors/error' -PSPath 'MACHINE/WEBROOT/APPHOST'
-    foreach ($entry in $errorEntries) {
-        $expandedPrefix = [Environment]::ExpandEnvironmentVariables($entry.prefixLanguageFilePath)
-        if ($expandedPrefix -like "$OldInetpubRoot*") {
-            $filter = "/system.webServer/httpErrors/error[@statusCode='$($entry.statusCode)' and @subStatusCode='$($entry.subStatusCode)']"
-            Set-WebConfigurationProperty -Filter $filter -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'prefixLanguageFilePath' -Value $NewCusterrPath
-        }
-    }
-    Write-Host "  Custom error pages now served from $NewCusterrPath" -ForegroundColor Green
-}
-
-Write-Host "`n==> Updating siteDefaults log/trace directories" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('IIS:\ (siteDefaults)', 'Set default log/trace directories')) {
-    Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' `
-        -Name 'directory' -Value $LogFilesTarget -PSPath 'IIS:\'
-    Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/traceFailedRequestsLogging' `
-        -Name 'directory' -Value $TraceLogsTarget -PSPath 'IIS:\'
-}
-
-
-# ---------------------------------------------------------------------------
-# 8. Update every existing site: physicalPath + per-site log/trace directory
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Updating existing sites, applications and virtual directories" -ForegroundColor Cyan
-
-function Move-PhysicalPath {
+function Move-PhysicalPathValue {
+    <#
+        Expands environment-variable tokens (IIS often stores paths as
+        "%SystemDrive%\inetpub\..." literally) before comparing/rewriting.
+    #>
     param(
         [Parameter(Mandatory)][string]$ItemPSPath,
-        [Parameter(Mandatory)][string]$CurrentPath
+        [Parameter(Mandatory)][string]$CurrentPath,
+        [Parameter(Mandatory)][string]$OldRoot,
+        [Parameter(Mandatory)][string]$NewRoot
     )
-    # IIS often stores paths as literal tokens like "%SystemDrive%\inetpub\wwwroot"
-    # rather than the expanded form, so expand before comparing.
     $expandedCurrent = [Environment]::ExpandEnvironmentVariables($CurrentPath)
-    if ($expandedCurrent -like "$OldInetpubRoot*") {
-        $suffix = $expandedCurrent.Substring($OldInetpubRoot.Length)
-        $newPath = Join-Path $NewInetpubRoot $suffix.TrimStart('\')
+    if ($expandedCurrent -like "$OldRoot*") {
+        $suffix  = $expandedCurrent.Substring($OldRoot.Length).TrimStart('\')
+        $newPath = Join-Path $NewRoot $suffix
         if ($PSCmdlet.ShouldProcess($ItemPSPath, "Set physicalPath -> $newPath")) {
             Set-ItemProperty -Path $ItemPSPath -Name physicalPath -Value $newPath
         }
@@ -193,141 +145,33 @@ function Move-PhysicalPath {
     return $CurrentPath
 }
 
-foreach ($site in Get-Website) {
-    $sitePsPath = "IIS:\Sites\$($site.Name)"
-    Write-Host "  Site: $($site.Name)" -ForegroundColor Yellow
-
-    # physicalPath (root of the site)
-    Move-PhysicalPath -ItemPSPath $sitePsPath -CurrentPath $site.physicalPath | Out-Null
-
-    # per-site log directory + trace log directory
-    if ($PSCmdlet.ShouldProcess($sitePsPath, 'Set logFile/trace directories')) {
-        Set-ItemProperty -Path $sitePsPath -Name logFile.directory -Value $LogFilesTarget
-        Set-ItemProperty -Path $sitePsPath -Name traceFailedRequestsLogging.directory -Value $TraceLogsTarget
-    }
-
-    # applications under the site
-    foreach ($app in Get-WebApplication -Site $site.Name) {
-        $appPsPath = "IIS:\Sites\$($site.Name)$($app.Path)"
-        Move-PhysicalPath -ItemPSPath $appPsPath -CurrentPath $app.PhysicalPath | Out-Null
-    }
-
-    # virtual directories under the site
-    foreach ($vdir in Get-WebVirtualDirectory -Site $site.Name) {
-        $vdirPsPath = "IIS:\Sites\$($site.Name)$($vdir.Path)"
-        Move-PhysicalPath -ItemPSPath $vdirPsPath -CurrentPath $vdir.PhysicalPath | Out-Null
-    }
-}
-
-# ---------------------------------------------------------------------------
-# 9. Restart IIS
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Starting IIS services" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('W3SVC, WAS', 'Start services')) {
-    Start-Service WAS
-    Start-Service W3SVC
-}
-
-# ---------------------------------------------------------------------------
-# 10. Verification report
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Verification" -ForegroundColor Cyan
-
-Write-Host "Registry PathWWWRoot:"
-(Get-ItemProperty -Path $inetStpKey).PathWWWRoot
-
-Write-Host "`nSite physical paths / log directories:"
-Get-Website | ForEach-Object {
-    [PSCustomObject]@{
-        Site           = $_.Name
-        PhysicalPath   = $_.physicalPath
-        LogDirectory   = (Get-ItemProperty "IIS:\Sites\$($_.Name)" -Name logFile.directory).Value
-        TraceDirectory = (Get-ItemProperty "IIS:\Sites\$($_.Name)" -Name traceFailedRequestsLogging.directory).Value
-    }
-} | Format-Table -AutoSize
-
-
-# ---------------------------------------------------------------------------
-# 11. Verify success, then auto-delete old C:\inetpub content
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Post-move verification (required before auto-delete)" -ForegroundColor Cyan
-
-$verificationPassed = $true
-
-# 11a. IIS services running
-foreach ($svcName in 'WAS', 'W3SVC') {
-    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    if (-not $svc -or $svc.Status -ne 'Running') {
-        Write-Warning "Service $svcName is not running."
-        $verificationPassed = $false
-    }
-}
-
-# 11b. New wwwroot exists and is not empty
-$newWwwroot = Join-Path $NewInetpubRoot 'wwwroot'
-if (-not (Test-Path $newWwwroot) -or -not (Get-ChildItem $newWwwroot -ErrorAction SilentlyContinue)) {
-    Write-Warning "New wwwroot at $newWwwroot is missing or empty."
-    $verificationPassed = $false
-}
-
-# 11c. Every site's physicalPath points to the new root, and resolves on disk
-foreach ($site in Get-Website) {
-    $site = Get-Website -Name $site.Name   # refresh after config changes
-    if ($site.physicalPath -notlike "$NewInetpubRoot*") {
-        Write-Warning "Site '$($site.Name)' physicalPath still points to $($site.physicalPath)."
-        $verificationPassed = $false
-    }
-    elseif (-not (Test-Path $site.physicalPath)) {
-        Write-Warning "Site '$($site.Name)' physicalPath $($site.physicalPath) does not exist on disk."
-        $verificationPassed = $false
-    }
-}
-
-# 11d. Old log/trace folders were emptied by the /MOVE step
-foreach ($p in @($OldLogFiles, $OldTraceLogs)) {
-    if (Test-Path $p) {
-        $remaining = Get-ChildItem $p -Recurse -ErrorAction SilentlyContinue
-        if ($remaining) {
-            Write-Warning "$p still contains files - move did not fully complete."
-            $verificationPassed = $false
-        }
-    }
-}
-
 function Remove-DirectoryRobust {
+    <#
+        Layered forced-delete: plain delete -> ownership/ACL repair (handles
+        TrustedInstaller-owned files) -> robocopy purge -> SYSTEM-context
+        scheduled task as a last resort. Assumes IIS is already stopped.
+    #>
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path $Path)) { return }
 
-    # Step 9 restarted IIS, which re-locks server-wide resources like the
-    # default custom error pages (500-100.asp etc.) unless they were
-    # relocated - stop everything again right before deleting.
-    Write-Host "  Stopping IIS services/worker processes before cleanup..." -ForegroundColor DarkGray
-    Get-Process w3wp -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
-    Stop-Service WAS -Force -ErrorAction SilentlyContinue
-
     try {
         Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
-        Start-Service WAS -ErrorAction SilentlyContinue
-        Start-Service W3SVC -ErrorAction SilentlyContinue
+        Write-Host "  Removed $Path." -ForegroundColor Green
         return
     }
     catch {
         Write-Warning "Standard removal of $Path failed ($($_.Exception.Message)). Repairing ownership/ACLs and retrying..."
     }
 
-    # /A takes ownership for the Administrators group specifically - needed
-    # for files owned by TrustedInstaller (e.g. default custerr pages).
     Start-Process takeown -ArgumentList @('/F', "`"$Path`"", '/R', '/D', 'Y', '/A') -NoNewWindow -Wait | Out-Null
-    Start-Process icacls -ArgumentList @("`"$Path`"", '/reset', '/T', '/C') -NoNewWindow -Wait | Out-Null
-    Start-Process icacls -ArgumentList @("`"$Path`"", '/grant', 'Administrators:F', '/T', '/C') -NoNewWindow -Wait | Out-Null
-    Start-Process attrib -ArgumentList @('-R', '-S', '-H', "`"$Path\*.*`"", '/S', '/D') -NoNewWindow -Wait | Out-Null
+    Start-Process icacls  -ArgumentList @("`"$Path`"", '/reset', '/T', '/C') -NoNewWindow -Wait | Out-Null
+    Start-Process icacls  -ArgumentList @("`"$Path`"", '/grant', 'Administrators:F', '/T', '/C') -NoNewWindow -Wait | Out-Null
+    Start-Process attrib  -ArgumentList @('-R', '-S', '-H', "`"$Path\*.*`"", '/S', '/D') -NoNewWindow -Wait | Out-Null
 
     try {
         Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
-        Start-Service WAS -ErrorAction SilentlyContinue
-        Start-Service W3SVC -ErrorAction SilentlyContinue
+        Write-Host "  Removed $Path after ownership/ACL repair." -ForegroundColor Green
         return
     }
     catch {
@@ -336,7 +180,7 @@ function Remove-DirectoryRobust {
 
     $emptyDir = Join-Path $env:TEMP "empty_$([guid]::NewGuid())"
     New-Item -ItemType Directory -Path $emptyDir | Out-Null
-    Start-Process robocopy -ArgumentList @("`"$emptyDir`"", "`"$Path`"", '/MIR', '/R:1', '/W:1', '/NFL', '/NDL', '/NP') -NoNewWindow -Wait | Out-Null
+    Invoke-Robocopy -Source $emptyDir -Destination $Path -Options @('/MIR', '/R:1', '/W:1', '/NFL', '/NDL', '/NP') -AllowFailure | Out-Null
     Remove-Item -Path $emptyDir -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -350,25 +194,203 @@ function Remove-DirectoryRobust {
         schtasks /delete /tn $taskName /f -ErrorAction SilentlyContinue | Out-Null
     }
 
-    Start-Service WAS -ErrorAction SilentlyContinue
-    Start-Service W3SVC -ErrorAction SilentlyContinue
-
     if (Test-Path $Path) {
         Write-Warning "Could not fully remove $Path even via SYSTEM task. Manual investigation required (check open handles with Sysinternals handle.exe)."
     }
     else {
-        Write-Host "Removed $Path." -ForegroundColor Green
+        Write-Host "  Removed $Path via forced fallback." -ForegroundColor Green
     }
 }
 
-if ($verificationPassed) {
-    Write-Host "All checks passed. Removing old content at $OldInetpubRoot ..." -ForegroundColor Green
-    if ($PSCmdlet.ShouldProcess($OldInetpubRoot, 'Remove old inetpub content')) {
-        Remove-DirectoryRobust -Path $OldInetpubRoot
+# ===========================================================================
+# Main
+# ===========================================================================
+New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
+Start-Transcript -Path $TranscriptPath | Out-Null
+
+$iisWasStopped = $false
+
+try {
+    Write-Host "==> Pre-flight checks" -ForegroundColor Cyan
+    Test-DriveReady -Path $NewInetpubRoot
+    Test-DriveReady -Path $LogsRoot
+    if (-not (Get-Website)) {
+        Write-Warning "No IIS sites found via Get-Website - is IIS installed?"
+    }
+
+    Write-Host "`n==> Stopping IIS (single maintenance window for the whole operation)" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess('W3SVC, WAS', 'Stop services')) {
+        Stop-IISServices
+        $iisWasStopped = $true
+    }
+
+    Write-Host "`n==> Backing up applicationHost.config to $BackupConfigPath" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess($BackupConfigPath, 'Copy applicationHost.config')) {
+        Copy-Item 'C:\Windows\System32\inetsrv\config\applicationHost.config' $BackupConfigPath
+    }
+
+    Write-Host "`n==> Creating target folders" -ForegroundColor Cyan
+    foreach ($p in @($NewInetpubRoot, $LogFilesTarget, $TraceLogsTarget)) {
+        if ($PSCmdlet.ShouldProcess($p, 'Create directory')) {
+            New-Item -ItemType Directory -Path $p -Force | Out-Null
+        }
+    }
+
+    Write-Host "`n==> Copying $OldInetpubRoot -> $NewInetpubRoot (excluding logs)" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess("$OldInetpubRoot -> $NewInetpubRoot", 'Robocopy mirror')) {
+        $code = Invoke-Robocopy -Source $OldInetpubRoot -Destination $NewInetpubRoot -Options @(
+            '/MIR', '/COPYALL', '/DCOPY:DAT', '/XD', "`"$OldLogsFolder`"", '/R:2', '/W:5', '/NFL', '/NDL', '/NP'
+        )
+        Write-Host "Robocopy completed (exit code $code, 0-7 = success)." -ForegroundColor Green
+    }
+
+    Write-Host "`n==> Moving existing log data to $LogsRoot" -ForegroundColor Cyan
+    foreach ($pair in @(
+            @{ Src = $OldLogFiles;  Dst = $LogFilesTarget },
+            @{ Src = $OldTraceLogs; Dst = $TraceLogsTarget }
+        )) {
+        if (Test-Path $pair.Src) {
+            if ($PSCmdlet.ShouldProcess("$($pair.Src) -> $($pair.Dst)", 'Move log data')) {
+                Invoke-Robocopy -Source $pair.Src -Destination $pair.Dst -Options @('/E', '/MOVE', '/R:2', '/W:5', '/NFL', '/NDL', '/NP') | Out-Null
+            }
+        }
+        else {
+            Write-Host "  (no existing data at $($pair.Src), skipping)" -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host "`n==> Updating registry PathWWWRoot" -ForegroundColor Cyan
+    $inetStpKey = 'HKLM:\SOFTWARE\Microsoft\InetStp'
+    if ($PSCmdlet.ShouldProcess($inetStpKey, 'Set PathWWWRoot')) {
+        Set-ItemProperty -Path $inetStpKey -Name 'PathWWWRoot' -Value (Join-Path $NewInetpubRoot 'wwwroot')
+    }
+
+    Write-Host "`n==> Relocating custom error page path (httpErrors) off the old inetpub root" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST (httpErrors)', 'Repoint prefixLanguageFilePath')) {
+        $errorEntries = Get-WebConfiguration '/system.webServer/httpErrors/error' -PSPath 'MACHINE/WEBROOT/APPHOST'
+        foreach ($entry in $errorEntries) {
+            $expandedPrefix = [Environment]::ExpandEnvironmentVariables($entry.prefixLanguageFilePath)
+            if ($expandedPrefix -like "$OldInetpubRoot*") {
+                $filter = "/system.webServer/httpErrors/error[@statusCode='$($entry.statusCode)' and @subStatusCode='$($entry.subStatusCode)']"
+                Set-WebConfigurationProperty -Filter $filter -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'prefixLanguageFilePath' -Value $NewCusterrPath
+            }
+        }
+        Write-Host "  Custom error pages now served from $NewCusterrPath" -ForegroundColor Green
+    }
+
+    Write-Host "`n==> Updating siteDefaults log/trace directories" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess('IIS:\ (siteDefaults)', 'Set default log/trace directories')) {
+        Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' `
+            -Name 'directory' -Value $LogFilesTarget -PSPath 'IIS:\'
+        Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/traceFailedRequestsLogging' `
+            -Name 'directory' -Value $TraceLogsTarget -PSPath 'IIS:\'
+    }
+
+    Write-Host "`n==> Updating existing sites, applications and virtual directories" -ForegroundColor Cyan
+    foreach ($site in Get-Website) {
+        $sitePsPath = "IIS:\Sites\$($site.Name)"
+        Write-Host "  Site: $($site.Name)" -ForegroundColor Yellow
+
+        Move-PhysicalPathValue -ItemPSPath $sitePsPath -CurrentPath $site.physicalPath -OldRoot $OldInetpubRoot -NewRoot $NewInetpubRoot | Out-Null
+
+        if ($PSCmdlet.ShouldProcess($sitePsPath, 'Set logFile/trace directories')) {
+            Set-ItemProperty -Path $sitePsPath -Name logFile.directory -Value $LogFilesTarget
+            Set-ItemProperty -Path $sitePsPath -Name traceFailedRequestsLogging.directory -Value $TraceLogsTarget
+        }
+
+        foreach ($app in Get-WebApplication -Site $site.Name) {
+            $appPsPath = "IIS:\Sites\$($site.Name)$($app.Path)"
+            Move-PhysicalPathValue -ItemPSPath $appPsPath -CurrentPath $app.PhysicalPath -OldRoot $OldInetpubRoot -NewRoot $NewInetpubRoot | Out-Null
+        }
+
+        foreach ($vdir in Get-WebVirtualDirectory -Site $site.Name) {
+            $vdirPsPath = "IIS:\Sites\$($site.Name)$($vdir.Path)"
+            Move-PhysicalPathValue -ItemPSPath $vdirPsPath -CurrentPath $vdir.PhysicalPath -OldRoot $OldInetpubRoot -NewRoot $NewInetpubRoot | Out-Null
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # Verify the move succeeded (config-only checks - IIS is still stopped)
+    # -----------------------------------------------------------------------
+    Write-Host "`n==> Verifying the move before cleanup" -ForegroundColor Cyan
+    $verificationPassed = $true
+
+    $newWwwroot = Join-Path $NewInetpubRoot 'wwwroot'
+    if (-not (Test-Path $newWwwroot) -or -not (Get-ChildItem $newWwwroot -ErrorAction SilentlyContinue)) {
+        Write-Warning "New wwwroot at $newWwwroot is missing or empty."
+        $verificationPassed = $false
+    }
+
+    foreach ($site in Get-Website) {
+        $site = Get-Website -Name $site.Name   # refresh after config changes
+        if ($site.physicalPath -notlike "$NewInetpubRoot*") {
+            Write-Warning "Site '$($site.Name)' physicalPath still points to $($site.physicalPath)."
+            $verificationPassed = $false
+        }
+        elseif (-not (Test-Path $site.physicalPath)) {
+            Write-Warning "Site '$($site.Name)' physicalPath $($site.physicalPath) does not exist on disk."
+            $verificationPassed = $false
+        }
+    }
+
+    foreach ($p in @($OldLogFiles, $OldTraceLogs)) {
+        if (Test-Path $p) {
+            $remaining = Get-ChildItem $p -Recurse -ErrorAction SilentlyContinue
+            if ($remaining) {
+                Write-Warning "$p still contains files - move did not fully complete."
+                $verificationPassed = $false
+            }
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # Cleanup old content (IIS still stopped, so no lock/ownership conflicts)
+    # -----------------------------------------------------------------------
+    if ($SkipCleanup) {
+        Write-Host "`n-SkipCleanup specified - leaving $OldInetpubRoot in place." -ForegroundColor Yellow
+    }
+    elseif ($verificationPassed) {
+        Write-Host "`n==> All checks passed. Removing old content at $OldInetpubRoot ..." -ForegroundColor Cyan
+        if ($PSCmdlet.ShouldProcess($OldInetpubRoot, 'Remove old inetpub content')) {
+            Remove-DirectoryRobust -Path $OldInetpubRoot
+        }
+    }
+    else {
+        Write-Warning "One or more verification checks failed. Old content at $OldInetpubRoot has been LEFT IN PLACE for manual review - not deleted."
     }
 }
-else {
-    Write-Warning "One or more verification checks failed. Old content at $OldInetpubRoot has been LEFT IN PLACE for manual review - not deleted."
+finally {
+    # Always attempt to bring IIS back up, even if something above threw.
+    if ($iisWasStopped) {
+        Write-Host "`n==> Restarting IIS" -ForegroundColor Cyan
+        Start-IISServices
+    }
+    Stop-Transcript | Out-Null
 }
 
+# ---------------------------------------------------------------------------
+# Final verification report (now that IIS is back up)
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Final report" -ForegroundColor Cyan
+
+foreach ($svcName in 'WAS', 'W3SVC') {
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    Write-Host "  $svcName status: $($svc.Status)" -ForegroundColor $(if ($svc.Status -eq 'Running') { 'Green' } else { 'Red' })
+}
+
+Write-Host "`nRegistry PathWWWRoot:"
+(Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\InetStp').PathWWWRoot
+
+Write-Host "`nSite physical paths / log directories:"
+Get-Website | ForEach-Object {
+    [PSCustomObject]@{
+        Site           = $_.Name
+        PhysicalPath   = $_.physicalPath
+        LogDirectory   = (Get-ItemProperty "IIS:\Sites\$($_.Name)" -Name logFile.directory).Value
+        TraceDirectory = (Get-ItemProperty "IIS:\Sites\$($_.Name)" -Name traceFailedRequestsLogging.directory).Value
+    }
+} | Format-Table -AutoSize
+
+Write-Host "Old inetpub present: $(Test-Path $OldInetpubRoot)"
+Write-Host "Transcript saved to: $TranscriptPath"
 Write-Host "`nDone." -ForegroundColor Green
