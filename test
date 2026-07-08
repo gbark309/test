@@ -2,13 +2,17 @@
 .SYNOPSIS
     Sets Windows Authentication (Negotiate:Kerberos only, kernel-mode off) as
     the SERVER-LEVEL default in IIS, so every site - existing and future -
-    inherits it automatically, and disables all other authentication methods.
+    inherits it automatically, disables all other authentication methods, and
+    enables + starts the Management Service (WMSVC) with its logging
+    redirected to E:\Logs\WMSVC.
 
 .DESCRIPTION
     Rather than looping through each site and setting an explicit override
     (which a new site created later would NOT inherit), this script:
 
-    1. Backs up applicationHost.config.
+    1. Backs up applicationHost.config, and snapshots the pre-change WMSVC
+       registry/service state (needed for -Revert, since those aren't part
+       of applicationHost.config).
     2. Sets the SERVER-LEVEL default FIRST (MACHINE/WEBROOT/APPHOST, no
        location):
          - windowsAuthentication: enabled = true
@@ -25,22 +29,35 @@
        step fails partway through, every site still has either its original
        config or the new good default - never a moment with no auth config
        at all falling back to IIS's raw (less secure) schema defaults.
+    4. Enables Management Service remote management, redirects its logging
+       to -WmsvcLogDirectory, grants that folder's actual service account
+       access to it, sets the service to Automatic, and starts it.
 
-    Because this is set once at the server level with no site-level
-    overrides left in place, any site created AFTER this script runs
-    inherits the same Kerberos-only configuration automatically - nothing
-    further to do per new site.
+    Because the auth settings are set once at the server level with no
+    site-level overrides left in place, any site created AFTER this script
+    runs inherits the same Kerberos-only configuration automatically.
+
+    NOTE ON OVERLAP: Configure-IIS-Sites.ps1 also configures WMSVC. If you
+    run both scripts, WMSVC ends up configured twice (harmless/idempotent,
+    but redundant) - consider removing the WMSVC step from whichever script
+    you run second, or from Configure-IIS-Sites.ps1 if this script now
+    always runs first in your build order.
 
 .PARAMETER Revert
     Restores applicationHost.config from the backup taken by a previous run
-    of this script, undoing everything above. Use -Timestamp to pick a
-    specific prior run; otherwise the most recent backup is used.
+    of this script, and restores the WMSVC registry values and service state
+    to what they were before that run - undoing everything above. Use
+    -Timestamp to pick a specific prior run; otherwise the most recent
+    backup is used.
 
 .PARAMETER Timestamp
     Used with -Revert to pick a specific backup (format: yyyyMMdd_HHmmss).
 
 .PARAMETER ListBackups
     Lists available backups and exits without changing anything.
+
+.PARAMETER WmsvcLogDirectory
+    Log directory for the Management Service. Default: E:\Logs\WMSVC
 
 .NOTES
     Run elevated. Supports -WhatIf.
@@ -61,11 +78,11 @@ param(
     [switch]$Revert,
     [string]$Timestamp,
     [switch]$ListBackups,
-    [string]$BackupFolder = 'C:\Config-Backups'
+    [string]$BackupFolder = 'C:\Config-Backups',
+    [string]$WmsvcLogDirectory = 'E:\Logs\WMSVC'
 )
 
 $ErrorActionPreference = 'Stop'
-Import-Module WebAdministration
 
 New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null
 $ConfigPath = 'C:\Windows\System32\inetsrv\config\applicationHost.config'
@@ -134,6 +151,52 @@ if ($Revert) {
             Copy-Item -Path $backup.FullName -Destination $ConfigPath -Force
             Write-Host "  Restored." -ForegroundColor Green
         }
+
+        # Restore WMSVC registry/service state, if this run captured one
+        # (older backups taken before WMSVC support was added won't have a
+        # matching state file - skip gracefully in that case).
+        $backupTs  = $backup.BaseName -replace '.*_(\d{8}_\d{6})$', '$1'
+        $stateFile = Join-Path $BackupFolder "Set-IIS-WindowsAuthentication_state_$backupTs.json"
+        if (Test-Path $stateFile) {
+            Write-Host "`n==> Restoring WMSVC registry/service state" -ForegroundColor Cyan
+            $state = Get-Content -Path $stateFile -Raw | ConvertFrom-Json
+            $wmsvcKeyPath = 'HKLM:\SOFTWARE\Microsoft\WebManagement\Server'
+
+            if (-not $state.WmsvcKeyExisted) {
+                if ($PSCmdlet.ShouldProcess($wmsvcKeyPath, 'Remove key (did not exist before)')) {
+                    Remove-Item -Path $wmsvcKeyPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+            else {
+                foreach ($pair in @(
+                        @{ Name = 'EnableRemoteManagement'; Value = $state.WmsvcEnableRemoteMgmt; Type = 'DWord' }
+                        @{ Name = 'LoggingDirectory';        Value = $state.WmsvcLoggingDirectory; Type = 'String' }
+                    )) {
+                    if ($null -eq $pair.Value) {
+                        if ($PSCmdlet.ShouldProcess("$wmsvcKeyPath\$($pair.Name)", 'Remove value (did not exist before)')) {
+                            Remove-ItemProperty -Path $wmsvcKeyPath -Name $pair.Name -ErrorAction SilentlyContinue
+                        }
+                    }
+                    else {
+                        if ($PSCmdlet.ShouldProcess("$wmsvcKeyPath\$($pair.Name)", 'Restore value')) {
+                            Set-ItemProperty -Path $wmsvcKeyPath -Name $pair.Name -Value $pair.Value -Type $pair.Type
+                        }
+                    }
+                }
+            }
+
+            if ($state.WmsvcServiceExisted -and (Get-Service -Name WMSVC -ErrorAction SilentlyContinue)) {
+                if ($PSCmdlet.ShouldProcess('WMSVC', "Restore StartType=$($state.WmsvcStartType), Running=$($state.WmsvcWasRunning)")) {
+                    Set-Service -Name WMSVC -StartupType $state.WmsvcStartType
+                    if ($state.WmsvcWasRunning) { Start-Service -Name WMSVC -ErrorAction SilentlyContinue }
+                    else { Stop-Service -Name WMSVC -Force -ErrorAction SilentlyContinue }
+                }
+            }
+            Write-Host "  WMSVC state restored." -ForegroundColor Green
+        }
+        else {
+            Write-Host "  (no WMSVC state file for this backup - nothing to restore there)" -ForegroundColor DarkGray
+        }
     }
     finally {
         Start-Service WAS -ErrorAction SilentlyContinue
@@ -164,81 +227,175 @@ if ($PSCmdlet.ShouldProcess($BackupConfigPath, 'Copy applicationHost.config')) {
     Copy-Item $ConfigPath $BackupConfigPath
 }
 
-$authSections = @(
-    'system.webServer/security/authentication/windowsAuthentication',
-    'system.webServer/security/authentication/anonymousAuthentication',
-    'system.webServer/security/authentication/basicAuthentication',
-    'system.webServer/security/authentication/digestAuthentication'
-)
+# ---------------------------------------------------------------------------
+# Capture pre-change WMSVC registry/service state for -Revert. $null means
+# "did not exist before" (revert should remove it, not set it to something
+# else) rather than "existed and was null".
+# ---------------------------------------------------------------------------
+$wmsvcKeyPath = 'HKLM:\SOFTWARE\Microsoft\WebManagement\Server'
+$preState = [PSCustomObject]@{
+    WmsvcKeyExisted       = Test-Path $wmsvcKeyPath
+    WmsvcEnableRemoteMgmt = if (Test-Path $wmsvcKeyPath) { (Get-ItemProperty -Path $wmsvcKeyPath -Name EnableRemoteManagement -ErrorAction SilentlyContinue).EnableRemoteManagement } else { $null }
+    WmsvcLoggingDirectory = if (Test-Path $wmsvcKeyPath) { (Get-ItemProperty -Path $wmsvcKeyPath -Name LoggingDirectory -ErrorAction SilentlyContinue).LoggingDirectory } else { $null }
+    WmsvcServiceExisted   = [bool](Get-Service -Name WMSVC -ErrorAction SilentlyContinue)
+    WmsvcStartType        = (Get-Service -Name WMSVC -ErrorAction SilentlyContinue).StartType.ToString()
+    WmsvcWasRunning       = (Get-Service -Name WMSVC -ErrorAction SilentlyContinue).Status -eq 'Running'
+}
+$StateFilePath = Join-Path $BackupFolder "Set-IIS-WindowsAuthentication_state_$RunTimestamp.json"
+$preState | ConvertTo-Json | Set-Content -Path $StateFilePath -Encoding UTF8
+Write-Host "  WMSVC pre-change state saved to $StateFilePath" -ForegroundColor DarkGray
+
+# Load the underlying API directly and do everything in ONE session with a
+# SINGLE CommitChanges() at the end, instead of the WebAdministration cmdlets
+# (Set-WebConfigurationProperty, Clear-WebConfiguration, etc.) which each
+# independently open, modify, and write the whole applicationHost.config file
+# to disk per call - with 4 sections x N sites plus server-level changes,
+# that's a lot of redundant disk I/O. This is safe to batch here because
+# nothing else writes to the file while this session is open (unlike a script
+# that also mixes in separate cmdlet calls interleaved with a held-open
+# session, which would risk one overwriting the other's changes).
+Add-Type -Path "$env:windir\System32\inetsrv\Microsoft.Web.Administration.dll" -ErrorAction SilentlyContinue
+
+$WinAuthPath = 'system.webServer/security/authentication/windowsAuthentication'
+$AnonPath    = 'system.webServer/security/authentication/anonymousAuthentication'
+$BasicPath   = 'system.webServer/security/authentication/basicAuthentication'
+$DigestPath  = 'system.webServer/security/authentication/digestAuthentication'
+
+$mgr = New-Object Microsoft.Web.Administration.ServerManager
+try {
+    $config = $mgr.GetApplicationHostConfiguration()
+
+    # -----------------------------------------------------------------------
+    # 1. Server-level default FIRST (see earlier note on why this ordering
+    #    matters: avoids a window where sites have no auth config at all).
+    # -----------------------------------------------------------------------
+    Write-Host "`n==> Setting server-level Windows Authentication default (Negotiate:Kerberos only)" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set authentication defaults')) {
+        $winAuthSection = $config.GetSection($WinAuthPath, '')
+        $winAuthSection['enabled']       = $true
+        $winAuthSection['useKernelMode'] = $false
+
+        $providers = $winAuthSection.GetCollection('providers')
+        $providers.Clear()
+        $newProvider = $providers.CreateElement('add')
+        $newProvider.SetAttributeValue('value', 'Negotiate:Kerberos')
+        $providers.Add($newProvider) | Out-Null
+
+        Write-Host "  Disabling Anonymous / Basic / Digest authentication (server-level default)" -ForegroundColor DarkGray
+        $config.GetSection($AnonPath, '')['enabled'] = $false
+
+        foreach ($path in @($BasicPath, $DigestPath)) {
+            try {
+                $config.GetSection($path, '')['enabled'] = $false
+            }
+            catch {
+                Write-Host "    ($path not present - role service not installed, nothing to disable)" -ForegroundColor DarkGray
+            }
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # 2. Clear per-site overrides so every site falls back to the server
+    #    default set above, instead of keeping a stale local value.
+    #    RevertToParent() is the direct API equivalent of Clear-WebConfiguration.
+    # -----------------------------------------------------------------------
+    Write-Host "`n==> Removing site-level authentication overrides (so all sites inherit the server default)" -ForegroundColor Cyan
+    $siteNames = $mgr.Sites | ForEach-Object { $_.Name }
+    foreach ($siteName in $siteNames) {
+        Write-Host "  $siteName" -ForegroundColor DarkGray
+        if (-not $PSCmdlet.ShouldProcess($siteName, 'Clear site-level authentication overrides')) { continue }
+        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath)) {
+            try {
+                $config.GetSection($path, $siteName).RevertToParent()
+            }
+            catch {
+                # Expected in the common case: no local override present
+                # (already inheriting), or section not applicable. Logged
+                # (not fully silent) so a genuine unexpected failure is
+                # still visible in the transcript.
+                Write-Host "    ($path : nothing to clear - $($_.Exception.Message))" -ForegroundColor DarkGray
+            }
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # Single commit - this is the only disk write for the entire run.
+    # -----------------------------------------------------------------------
+    Write-Host "`n==> Committing all changes (single write to applicationHost.config)" -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess('applicationHost.config', 'Commit batched changes')) {
+        $mgr.CommitChanges()
+    }
+}
+finally {
+    $mgr.Dispose()
+}
 
 # ---------------------------------------------------------------------------
-# 1. Set the server-level default FIRST. If step 2 (clearing per-site
-#    overrides) fails partway, sites not yet touched still have their old
-#    explicit config, and sites already cleared correctly inherit this good
-#    default - rather than momentarily falling back to IIS's raw schema
-#    defaults (anonymous ON, Windows auth OFF), which is what would happen
-#    if the clearing ran first and this step then failed.
+# Management Service (WMSVC) - separate mechanism (registry + service),
+# unrelated to applicationHost.config, so no interaction with the batched
+# session above.
 # ---------------------------------------------------------------------------
-Write-Host "`n==> Setting server-level Windows Authentication default (Negotiate:Kerberos only)" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set authentication defaults')) {
-    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
-    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'useKernelMode' -Value $false
+Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
+    New-Item -ItemType Directory -Path $WmsvcLogDirectory -Force | Out-Null
 
-    Clear-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -PSPath 'MACHINE/WEBROOT/APPHOST'
-    Add-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{value = 'Negotiate:Kerberos' }
+    # WMSVC does not always run as SYSTEM - grant whichever account it's
+    # actually configured for explicit access to the new log folder, since
+    # inherited permissions on E:\Logs may not cover that account.
+    $wmsvcAccount = (Get-CimInstance Win32_Service -Filter "Name='WMSVC'" -ErrorAction SilentlyContinue).StartName
+    if ($wmsvcAccount) {
+        Write-Host "  WMSVC runs as '$wmsvcAccount' - granting it Modify on $WmsvcLogDirectory" -ForegroundColor DarkGray
+        icacls $WmsvcLogDirectory /grant "${wmsvcAccount}:(OI)(CI)M" /T /C | Out-Null
+    }
 
-    Write-Host "  Disabling Anonymous / Basic / Digest authentication (server-level default)" -ForegroundColor DarkGray
-    Set-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $false
+    if (-not (Test-Path $wmsvcKeyPath)) {
+        New-Item -Path $wmsvcKeyPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $wmsvcKeyPath -Name 'EnableRemoteManagement' -Value 1 -Type DWord
+    Set-ItemProperty -Path $wmsvcKeyPath -Name 'LoggingDirectory' -Value $WmsvcLogDirectory -Type String
 
-    foreach ($authSection in 'basicAuthentication', 'digestAuthentication') {
-        try {
-            Set-WebConfigurationProperty -Filter "system.webServer/security/authentication/$authSection" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $false -ErrorAction Stop
-        }
-        catch {
-            Write-Host "    ($authSection section not present - role service not installed, nothing to disable)" -ForegroundColor DarkGray
-        }
+    $wmsvcService = Get-Service -Name WMSVC -ErrorAction SilentlyContinue
+    if (-not $wmsvcService) {
+        Write-Warning "WMSVC service not found - is the 'Management Service' (Web-Mgmt-Service) role service installed?"
+    }
+    else {
+        Set-Service -Name WMSVC -StartupType Automatic
+        Start-Service -Name WMSVC
+        Write-Host "  WMSVC set to Automatic and started. Logging to $WmsvcLogDirectory" -ForegroundColor Green
     }
 }
 
 # ---------------------------------------------------------------------------
-# 2. Remove any per-site overrides so every site falls back to the server
-#    default set above, instead of keeping a stale local value.
-# ---------------------------------------------------------------------------
-Write-Host "`n==> Removing site-level authentication overrides (so all sites inherit the server default)" -ForegroundColor Cyan
-foreach ($site in Get-Website) {
-    $sitePsPath = "IIS:\Sites\$($site.Name)"
-    Write-Host "  $($site.Name)" -ForegroundColor DarkGray
-    if (-not $PSCmdlet.ShouldProcess($site.Name, 'Clear site-level authentication overrides')) { continue }
-    foreach ($section in $authSections) {
-        try {
-            Clear-WebConfiguration -Filter $section -PSPath $sitePsPath -ErrorAction Stop
-        }
-        catch {
-            # Expected in the common case: no local override present (already
-            # inheriting), or section not applicable (e.g. Basic/Digest role
-            # service not installed). Logged (not fully silent) so a genuine
-            # unexpected failure is still visible in the transcript.
-            Write-Host "    ($section : nothing to clear - $($_.Exception.Message))" -ForegroundColor DarkGray
-        }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Verification - shows the EFFECTIVE (inherited) value per site, confirming
-# they're picking up the server default rather than a stale local override.
+# Verification - fresh read (new session) of the EFFECTIVE (inherited) value
+# per site, confirming they're picking up the server default rather than a
+# stale local override. Reads are cheap - no batching concerns here.
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Verification (effective values per site)" -ForegroundColor Cyan
-$verificationRows = foreach ($site in Get-Website) {
-    $sitePsPath = "IIS:\Sites\$($site.Name)"
-    [PSCustomObject]@{
-        Site               = $site.Name
-        WindowsAuthEnabled = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath $sitePsPath -Name enabled).Value
-        UseKernelMode      = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/windowsAuthentication' -PSPath $sitePsPath -Name useKernelMode).Value
-        Providers          = (Get-WebConfiguration -Filter 'system.webServer/security/authentication/windowsAuthentication/providers/add' -PSPath $sitePsPath | ForEach-Object { $_.value }) -join ', '
-        AnonymousEnabled   = (Get-WebConfigurationProperty -Filter 'system.webServer/security/authentication/anonymousAuthentication' -PSPath $sitePsPath -Name enabled).Value
+$verifyMgr = New-Object Microsoft.Web.Administration.ServerManager
+try {
+    $verifyConfig = $verifyMgr.GetApplicationHostConfiguration()
+    $verificationRows = foreach ($site in $verifyMgr.Sites) {
+        $winAuthSection = $verifyConfig.GetSection($WinAuthPath, $site.Name)
+        $anonSection    = $verifyConfig.GetSection($AnonPath, $site.Name)
+        $providerValues = @($winAuthSection.GetCollection('providers') | ForEach-Object { $_.GetAttributeValue('value') })
+
+        [PSCustomObject]@{
+            Site               = $site.Name
+            WindowsAuthEnabled = $winAuthSection['enabled']
+            UseKernelMode      = $winAuthSection['useKernelMode']
+            Providers          = ($providerValues -join ', ')
+            AnonymousEnabled   = $anonSection['enabled']
+        }
     }
+    $verificationRows | Format-Table -AutoSize
 }
-$verificationRows | Format-Table -AutoSize
+finally {
+    $verifyMgr.Dispose()
+}
+
+Write-Host "`nWMSVC status:" -ForegroundColor Yellow
+Get-Service -Name WMSVC -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType
+Get-ItemProperty -Path $wmsvcKeyPath -ErrorAction SilentlyContinue | Select-Object EnableRemoteManagement, LoggingDirectory | Format-List
 
 Write-Host "Backup saved to $BackupConfigPath - revert with:" -ForegroundColor DarkGray
 Write-Host "  .\$($MyInvocation.MyCommand.Name) -Revert -Timestamp $RunTimestamp" -ForegroundColor DarkGray
