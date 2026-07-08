@@ -41,7 +41,7 @@
     6. Adds a Failed Request Tracing rule for All content (path="*") at the
        SERVER level (MACHINE/WEBROOT/APPHOST), covering all four trace
        providers (WWW Server, ASP, ISAPI Extension, ASPNET) at Verbose, with
-       a status code range of 100-999 - inherited by every site the same way
+       a status code range of 403-999 - inherited by every site the same way
        authentication is.
     7. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
@@ -414,7 +414,7 @@ if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Add FRT rule: All conten
 
     Clear-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue
     Add-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{path = '*' }
-    Set-WebConfigurationProperty -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/failureDefinitions" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'statusCodes' -Value '100-999'
+    Set-WebConfigurationProperty -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/failureDefinitions" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'statusCodes' -Value '403-999'
 
     # Four FRT trace providers per Microsoft's traceProviderDefinitions schema.
     # ASP and ISAPI Extension have no sub-areas of their own.
@@ -429,7 +429,7 @@ if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Add FRT rule: All conten
         if ($p.Areas) { $value['areas'] = $p.Areas }
         Add-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas" -PSPath 'MACHINE/WEBROOT/APPHOST' -Value $value
     }
-    Write-Host "  Rule added: path=* covering WWW Server, ASP, ISAPI Extension, ASPNET at Verbose, status codes 100-999" -ForegroundColor DarkGray
+    Write-Host "  Rule added: path=* covering WWW Server, ASP, ISAPI Extension, ASPNET at Verbose, status codes 403-999" -ForegroundColor DarkGray
 }
 
 Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
