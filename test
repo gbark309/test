@@ -51,12 +51,20 @@
        at the SERVER level, clearing any per-site override the same way as
        the other settings above.
     8. Adds a .NET Authorization Rule (system.web/authorization) denying
-       anonymous users (<deny users="?"/>) at the SERVER level. Unlike the
-       other settings above, this is ADDITIVE, not clear-then-set: existing
-       site-specific authorization rules are left alone, since those may be
-       load-bearing for an app's own access control (e.g. role-based rules)
-       and stripping them could silently break something. Checks for an
-       existing identical rule first so re-running doesn't duplicate it.
+       anonymous users (<deny users="?"/>) at the SERVER level. This is
+       ADDITIVE, not clear-then-set: existing allow/deny rules (server-level
+       or per-site) are left in place; only ensures this specific deny rule
+       is present, checking first so re-running doesn't duplicate it.
+       CONFIRMED IN TESTING: unlike the system.webServer sections used
+       elsewhere in this script, calling RevertToParent() on this
+       system.web section at a site location breaks applicationHost.config
+       in a way that prevents WAS/W3SVC from starting - the write itself
+       doesn't error, but the resulting config fails validation at service
+       startup. Per-site overrides for this section are therefore
+       deliberately NOT cleared. This means a site with its own explicit
+       system.web/authorization override will keep using that instead of
+       inheriting this rule - check any such sites manually if this rule
+       needs to apply there too.
     9. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
@@ -396,12 +404,15 @@ try {
 
         Write-Host "  Adding .NET Authorization Rule: Deny Anonymous Users (server-level default)" -ForegroundColor DarkGray
         try {
-            # system.web/authorization ("? " denotes anonymous/unauthenticated
-            # users in ASP.NET's authorization syntax). This is additive, not
-            # a clear-then-set like the other settings above - existing
-            # allow/deny rules (server-level or per-site) are left in place;
-            # we only ensure this specific deny rule is present, checking
-            # first so re-running the script doesn't add a duplicate.
+            # system.web/authorization ("?" denotes anonymous/unauthenticated
+            # users in ASP.NET's authorization syntax). Additive at the
+            # server level only (existing rules left in place, checked first
+            # to avoid duplicates). Per-site overrides are deliberately NOT
+            # cleared here - confirmed in testing that RevertToParent() on
+            # this system.web section (unlike the system.webServer sections
+            # used elsewhere in this script) breaks applicationHost.config
+            # in a way that prevents WAS/W3SVC from starting, even though
+            # the write itself doesn't throw an error. See script header.
             $netAuthSection = $config.GetSection($NetAuthPath, '')
             $netAuthCollection = $netAuthSection.GetCollection()
             $existingDenyAnon = $netAuthCollection | Where-Object {
