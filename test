@@ -5,7 +5,8 @@
     inherits it automatically, disables all other authentication methods,
     sets the classic ASP session timeout to 15 minutes server-wide, sets the
     log event destination to Both Log File and ETW Event, adds a server-level
-    Failed Request Tracing rule for All content, and enables + starts the
+    Failed Request Tracing rule for All content, places portal.htm at the top
+    of the default document list server-wide, and enables + starts the
     Management Service (WMSVC) with its logging redirected to E:\Logs\WMSVC.
 
 .DESCRIPTION
@@ -43,7 +44,11 @@
        providers (WWW Server, ASP, ISAPI Extension, ASPNET) at Verbose, with
        a status code range of 403-999 - inherited by every site the same way
        authentication is.
-    7. Enables Management Service remote management, redirects its logging
+    7. Ensures -DefaultDocumentName (portal.htm by default) is in the default
+       document list and moves it to the TOP (first document IIS looks for),
+       at the SERVER level, clearing any per-site override the same way as
+       the other settings above.
+    8. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
 
@@ -76,6 +81,10 @@
 .PARAMETER AspSessionTimeoutMinutes
     Classic ASP session timeout, in minutes, set server-wide. Default: 15
 
+.PARAMETER DefaultDocumentName
+    Document to place at the top of the default document list, server-wide.
+    Default: portal.htm
+
 .NOTES
     Run elevated. Supports -WhatIf.
 
@@ -97,7 +106,8 @@ param(
     [switch]$ListBackups,
     [string]$BackupFolder = 'C:\Config-Backups',
     [string]$WmsvcLogDirectory = 'E:\Logs\WMSVC',
-    [int]$AspSessionTimeoutMinutes = 15
+    [int]$AspSessionTimeoutMinutes = 15,
+    [string]$DefaultDocumentName = 'portal.htm'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -279,6 +289,7 @@ $AnonPath    = 'system.webServer/security/authentication/anonymousAuthentication
 $BasicPath   = 'system.webServer/security/authentication/basicAuthentication'
 $DigestPath  = 'system.webServer/security/authentication/digestAuthentication'
 $AspPath = 'system.webServer/asp'
+$DefaultDocPath = 'system.webServer/defaultDocument'
 $aspSessionTimeout = [TimeSpan]::FromMinutes($AspSessionTimeoutMinutes)
 
 $mgr = New-Object Microsoft.Web.Administration.ServerManager
@@ -328,6 +339,16 @@ try {
             Write-Host "    ($AspPath not present - classic ASP (Web-ASP) role service is not installed, nothing to set)" -ForegroundColor DarkGray
             Write-Warning "Classic ASP session timeout was requested but the Web-ASP role service isn't installed, so this setting has no effect. Install it with: Install-WindowsFeature Web-ASP"
         }
+
+        Write-Host "  Placing '$DefaultDocumentName' at the top of the default document list (server-level default)" -ForegroundColor DarkGray
+        $defaultDocSection = $config.GetSection($DefaultDocPath, '')
+        $defaultDocSection['enabled'] = $true
+        $filesCollection = $defaultDocSection.GetCollection('files')
+        $existingDoc = $filesCollection | Where-Object { $_.GetAttributeValue('value') -eq $DefaultDocumentName }
+        if ($existingDoc) { $filesCollection.Remove($existingDoc) }
+        $newDocElement = $filesCollection.CreateElement('add')
+        $newDocElement.SetAttributeValue('value', $DefaultDocumentName)
+        $filesCollection.AddAt(0, $newDocElement)
     }
 
     # -----------------------------------------------------------------------
@@ -340,7 +361,7 @@ try {
     foreach ($siteName in $siteNames) {
         Write-Host "  $siteName" -ForegroundColor DarkGray
         if (-not $PSCmdlet.ShouldProcess($siteName, 'Clear site-level authentication overrides')) { continue }
-        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath)) {
+        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath, $DefaultDocPath)) {
             try {
                 $config.GetSection($path, $siteName).RevertToParent()
             }
@@ -486,6 +507,11 @@ try {
         $frtRulePath = (Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add" -PSPath "MACHINE/WEBROOT/APPHOST/$($site.Name)" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty path)
         $frtProviderNames = ((Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas/add" -PSPath "MACHINE/WEBROOT/APPHOST/$($site.Name)" -ErrorAction SilentlyContinue | ForEach-Object { $_.provider }) -join ', ')
 
+        $defaultDocsTop3 = try {
+            $siteDefaultDocSection = $verifyConfig.GetSection($DefaultDocPath, $site.Name)
+            ($siteDefaultDocSection.GetCollection('files') | Select-Object -First 3 | ForEach-Object { $_.GetAttributeValue('value') }) -join ', '
+        } catch { 'N/A' }
+
         [PSCustomObject]@{
             Site               = $site.Name
             WindowsAuthEnabled = $winAuthSection['enabled']
@@ -496,6 +522,7 @@ try {
             LogTarget          = $logTargetValue
             FrtRulePath        = $frtRulePath
             FrtProviders       = $frtProviderNames
+            DefaultDocsTop3    = $defaultDocsTop3
         }
     }
     $verificationRows | Format-Table -AutoSize
