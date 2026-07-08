@@ -2,7 +2,8 @@
 .SYNOPSIS
     Sets Windows Authentication (Negotiate:Kerberos only, kernel-mode off) as
     the SERVER-LEVEL default in IIS, so every site - existing and future -
-    inherits it automatically, disables all other authentication methods, and
+    inherits it automatically, disables all other authentication methods,
+    sets the classic ASP session timeout to 15 minutes server-wide, and
     enables + starts the Management Service (WMSVC) with its logging
     redirected to E:\Logs\WMSVC.
 
@@ -29,7 +30,12 @@
        step fails partway through, every site still has either its original
        config or the new good default - never a moment with no auth config
        at all falling back to IIS's raw (less secure) schema defaults.
-    4. Enables Management Service remote management, redirects its logging
+    4. Sets the classic ASP session timeout to -AspSessionTimeoutMinutes
+       server-wide (system.webServer/asp/session), clearing any per-site
+       overrides the same way authentication is handled, so it's genuinely
+       inherited everywhere rather than silently blocked by an existing
+       per-site value.
+    5. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
 
@@ -59,6 +65,9 @@
 .PARAMETER WmsvcLogDirectory
     Log directory for the Management Service. Default: E:\Logs\WMSVC
 
+.PARAMETER AspSessionTimeoutMinutes
+    Classic ASP session timeout, in minutes, set server-wide. Default: 15
+
 .NOTES
     Run elevated. Supports -WhatIf.
 
@@ -79,7 +88,8 @@ param(
     [string]$Timestamp,
     [switch]$ListBackups,
     [string]$BackupFolder = 'C:\Config-Backups',
-    [string]$WmsvcLogDirectory = 'E:\Logs\WMSVC'
+    [string]$WmsvcLogDirectory = 'E:\Logs\WMSVC',
+    [int]$AspSessionTimeoutMinutes = 15
 )
 
 $ErrorActionPreference = 'Stop'
@@ -260,6 +270,8 @@ $WinAuthPath = 'system.webServer/security/authentication/windowsAuthentication'
 $AnonPath    = 'system.webServer/security/authentication/anonymousAuthentication'
 $BasicPath   = 'system.webServer/security/authentication/basicAuthentication'
 $DigestPath  = 'system.webServer/security/authentication/digestAuthentication'
+$AspSessionPath = 'system.webServer/asp/session'
+$aspSessionTimeout = '{0:00}:{1:00}:00' -f [Math]::Floor($AspSessionTimeoutMinutes / 60), ($AspSessionTimeoutMinutes % 60)
 
 $mgr = New-Object Microsoft.Web.Administration.ServerManager
 try {
@@ -292,6 +304,9 @@ try {
                 Write-Host "    ($path not present - role service not installed, nothing to disable)" -ForegroundColor DarkGray
             }
         }
+
+        Write-Host "  Setting ASP session timeout to $AspSessionTimeoutMinutes minutes (server-level default)" -ForegroundColor DarkGray
+        $config.GetSection($AspSessionPath, '')['timeout'] = $aspSessionTimeout
     }
 
     # -----------------------------------------------------------------------
@@ -304,7 +319,7 @@ try {
     foreach ($siteName in $siteNames) {
         Write-Host "  $siteName" -ForegroundColor DarkGray
         if (-not $PSCmdlet.ShouldProcess($siteName, 'Clear site-level authentication overrides')) { continue }
-        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath)) {
+        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath, $AspSessionPath)) {
             try {
                 $config.GetSection($path, $siteName).RevertToParent()
             }
@@ -377,6 +392,7 @@ try {
     $verificationRows = foreach ($site in $verifyMgr.Sites) {
         $winAuthSection = $verifyConfig.GetSection($WinAuthPath, $site.Name)
         $anonSection    = $verifyConfig.GetSection($AnonPath, $site.Name)
+        $aspSection     = $verifyConfig.GetSection($AspSessionPath, $site.Name)
         $providerValues = @($winAuthSection.GetCollection('providers') | ForEach-Object { $_.GetAttributeValue('value') })
 
         [PSCustomObject]@{
@@ -385,6 +401,7 @@ try {
             UseKernelMode      = $winAuthSection['useKernelMode']
             Providers          = ($providerValues -join ', ')
             AnonymousEnabled   = $anonSection['enabled']
+            AspSessionTimeout  = $aspSection['timeout']
         }
     }
     $verificationRows | Format-Table -AutoSize
