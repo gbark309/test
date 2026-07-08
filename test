@@ -466,27 +466,36 @@ finally {
 
 # ---------------------------------------------------------------------------
 # Log event destination: Both Log File and ETW Event.
-# Uses the WebAdministration cmdlet (not the raw batched session above) -
-# logFile.logTargetW3C is a [Flags] enum in the strongly-typed API, not a
-# string, so it carries the same type-mismatch risk we just hit with the ASP
-# session timeout. This is only 1 property per site (not 4 x N like auth),
-# so the extra disk I/O from using the cmdlet here is negligible.
+# Uses appcmd.exe, NOT the WebAdministration cmdlets or the raw API.
+# CONFIRMED IN TESTING (twice): the WebAdministration cmdlets fail here with
+# "Object reference not set to an instance of an object" - this is the FIRST
+# WebAdministration cmdlet call in the script's execution (everything before
+# it uses the raw Microsoft.Web.Administration API directly), and that first
+# call appears to intermittently fail to initialize properly in this
+# environment regardless of PSPath syntax (IIS:\ vs MACHINE/WEBROOT/APPHOST
+# were both tried). appcmd.exe has no dependency on that PowerShell module/
+# provider stack and has proven reliable elsewhere in this script's history
+# (e.g. the .NET Authorization Rule troubleshooting), so it's used here too.
+# logFile.logTargetW3C is also a [Flags] enum in the strongly-typed raw API,
+# which was the other reason to avoid that path for this specific setting.
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Setting log event destination to File + ETW" -ForegroundColor Cyan
 try {
     if ($PSCmdlet.ShouldProcess('Log event destination', 'Set to File,ETW')) {
-        Import-Module WebAdministration -ErrorAction Stop
+        $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
+        if (-not (Test-Path $appcmd)) { throw "appcmd.exe not found at $appcmd" }
 
-        Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'logTargetW3C' -Value 'File,ETW'
+        & $appcmd set config -section:system.applicationHost/sites "/siteDefaults.logfile.logTargetW3C:File,ETW" /commit:apphost | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "appcmd failed setting siteDefaults logTargetW3C (exit $LASTEXITCODE)" }
         Write-Host "  siteDefaults set (applies to any site created later)" -ForegroundColor DarkGray
 
         foreach ($siteName in $siteNames) {
-            try {
-                Set-WebConfigurationProperty -Filter "system.applicationHost/sites/site[@name='$siteName']/logFile" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'logTargetW3C' -Value 'File,ETW' -ErrorAction Stop
+            & $appcmd set config -section:system.applicationHost/sites "/[name='$siteName'].logfile.logTargetW3C:File,ETW" /commit:apphost | Out-Null
+            if ($LASTEXITCODE -eq 0) {
                 Write-Host "  $siteName : File,ETW" -ForegroundColor DarkGray
             }
-            catch {
-                Write-Warning "Could not set log event destination for site '$siteName': $($_.Exception.Message)"
+            else {
+                Write-Warning "Could not set log event destination for site '$siteName' (appcmd exit $LASTEXITCODE)."
             }
         }
     }
@@ -505,11 +514,18 @@ catch {
 # the rule's nested structure (section -> collection -> element -> nested
 # collection) has more moving parts than is worth risking on the raw API
 # given the type-mismatch issues already hit twice in this script.
+# NOTE: the enabled= line below emits a confirmed-harmless warning
+# ("target configuration object ... not found at path") since
+# traceFailedRequestsLogging doesn't otherwise exist at the true server
+# root - the cmdlet auto-creates it and the setting still takes effect
+# correctly (verified). Suppressed with -WarningAction SilentlyContinue.
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Adding Failed Request Tracing rule: All content (*) - server level" -ForegroundColor Cyan
 try {
     if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Add FRT rule: All content')) {
-        Set-WebConfigurationProperty -Filter 'system.webServer/tracing/traceFailedRequestsLogging' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
+        Import-Module WebAdministration -ErrorAction Stop
+
+        Set-WebConfigurationProperty -Filter 'system.webServer/tracing/traceFailedRequestsLogging' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true -WarningAction SilentlyContinue
 
         Clear-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue
         Add-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{path = '*' }
@@ -623,6 +639,7 @@ catch {
 # stale local override. Reads are cheap - no batching concerns here.
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Verification (effective values per site)" -ForegroundColor Cyan
+Import-Module WebAdministration -ErrorAction SilentlyContinue
 $verifyMgr = New-Object Microsoft.Web.Administration.ServerManager
 try {
     $verifyConfig = $verifyMgr.GetApplicationHostConfiguration()
