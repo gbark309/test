@@ -52,27 +52,27 @@
        already had FRT configured before this script ran.
     7. Ensures -DefaultDocumentName (portal.htm by default) is in the default
        document list and moves it to the TOP (first document IIS looks for),
-       at the SERVER level.
-       CONFIRMED IN TESTING: clearing the per-site override for this section
-       (calling RevertToParent() the same way as the authentication sections
-       above) breaks applicationHost.config in a way that prevents WAS/W3SVC
-       from starting - the write itself doesn't error, but the resulting
-       config fails validation at service startup. Per-site overrides for
-       this section are therefore deliberately NOT cleared. This means a
-       site with its own explicit defaultDocument override will keep using
-       that instead of inheriting this setting - check any such sites
-       manually if this needs to apply there too.
+       at the SERVER level. Uses the WebAdministration cmdlet path, NOT the
+       raw API used for the sections above.
+       CONFIRMED IN TESTING: manipulating this collection via the raw
+       Microsoft.Web.Administration API (GetCollection/Remove/AddAt) wiped
+       out the ENTIRE existing default document list, leaving only
+       portal.htm - the raw collection read did not reliably reflect IIS's
+       actual effective list. Fixed by capturing the effective list via
+       Get-WebConfiguration first, then rebuilding it with portal.htm at the
+       front - nothing existing is lost. Per-site overrides are still not
+       cleared (a site with its own explicit override keeps using that).
     8. Adds a .NET Authorization Rule (system.web/authorization) denying
-       anonymous users (<deny users="?"/>) at the SERVER level. This is
-       ADDITIVE, not clear-then-set: existing allow/deny rules (server-level
-       or per-site) are left in place; only ensures this specific deny rule
-       is present, checking first so re-running doesn't duplicate it.
-       Per-site overrides for this section are also NOT cleared, as a
-       conservative precaution given the defaultDocument finding above -
-       this hasn't been specifically confirmed as a problem for this
-       section, but system.web sections have shown different behavior than
-       system.webServer sections in this script, so the safer default is to
-       leave per-site authorization rules untouched here too.
+       anonymous users (<deny users="?"/>) at the SERVER level. Uses the
+       WebAdministration cmdlet path with an explicit MACHINE/WEBROOT/APPHOST
+       PSPath, NOT the raw API.
+       CONFIRMED IN TESTING: the raw API's GetSection(path, '') for this
+       system.web section did not correctly target the true server root -
+       the rule ended up on a site instead of server-wide. The cmdlet path
+       with an explicit PSPath is the same proven-correct pattern already
+       used for the Failed Request Tracing rule above. Additive: existing
+       rules are left in place, checked first so re-running doesn't
+       duplicate it. Per-site overrides are not cleared.
     9. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
@@ -348,8 +348,6 @@ $AnonPath    = 'system.webServer/security/authentication/anonymousAuthentication
 $BasicPath   = 'system.webServer/security/authentication/basicAuthentication'
 $DigestPath  = 'system.webServer/security/authentication/digestAuthentication'
 $AspPath = 'system.webServer/asp'
-$DefaultDocPath = 'system.webServer/defaultDocument'
-$NetAuthPath = 'system.web/authorization'
 $aspSessionTimeout = [TimeSpan]::FromMinutes($AspSessionTimeoutMinutes)
 
 $mgr = New-Object Microsoft.Web.Administration.ServerManager
@@ -398,49 +396,6 @@ try {
         catch {
             Write-Host "    ($AspPath not present - classic ASP (Web-ASP) role service is not installed, nothing to set)" -ForegroundColor DarkGray
             Write-Warning "Classic ASP session timeout was requested but the Web-ASP role service isn't installed, so this setting has no effect. Install it with: Install-WindowsFeature Web-ASP"
-        }
-
-        Write-Host "  Placing '$DefaultDocumentName' at the top of the default document list (server-level default)" -ForegroundColor DarkGray
-        # NOTE: per-site override is deliberately NOT cleared for this
-        # section (no RevertToParent() call in the loop below) - confirmed
-        # in testing that clearing it breaks applicationHost.config in a way
-        # that prevents WAS/W3SVC from starting, even though the write
-        # itself doesn't throw an error. See script header.
-        $defaultDocSection = $config.GetSection($DefaultDocPath, '')
-        $defaultDocSection['enabled'] = $true
-        $filesCollection = $defaultDocSection.GetCollection('files')
-        $existingDoc = $filesCollection | Where-Object { $_.GetAttributeValue('value') -eq $DefaultDocumentName }
-        if ($existingDoc) { $filesCollection.Remove($existingDoc) }
-        $newDocElement = $filesCollection.CreateElement('add')
-        $newDocElement.SetAttributeValue('value', $DefaultDocumentName)
-        $filesCollection.AddAt(0, $newDocElement)
-
-        Write-Host "  Adding .NET Authorization Rule: Deny Anonymous Users (server-level default)" -ForegroundColor DarkGray
-        try {
-            # system.web/authorization ("?" denotes anonymous/unauthenticated
-            # users in ASP.NET's authorization syntax). Additive at the
-            # server level only (existing rules left in place, checked first
-            # to avoid duplicates). Per-site overrides are NOT cleared here -
-            # this hasn't specifically been confirmed as a problem (the
-            # confirmed WAS-startup issue was the defaultDocument section
-            # above), but as a conservative precaution given that finding,
-            # this section is also left server-level-only for now.
-            $netAuthSection = $config.GetSection($NetAuthPath, '')
-            $netAuthCollection = $netAuthSection.GetCollection()
-            $existingDenyAnon = $netAuthCollection | Where-Object {
-                $_.ElementTagName -eq 'deny' -and $_.GetAttributeValue('users') -eq '?'
-            }
-            if (-not $existingDenyAnon) {
-                $newDenyElement = $netAuthCollection.CreateElement('deny')
-                $newDenyElement.SetAttributeValue('users', '?')
-                $netAuthCollection.Add($newDenyElement) | Out-Null
-            }
-            else {
-                Write-Host "    (deny rule for anonymous users already present - not duplicated)" -ForegroundColor DarkGray
-            }
-        }
-        catch {
-            Write-Host "    ($NetAuthPath not present - nothing to set) - $($_.Exception.Message)" -ForegroundColor DarkGray
         }
     }
 
@@ -551,6 +506,77 @@ catch {
     Write-Warning "Failed Request Tracing rule step FAILED: $($_.Exception.Message). Continuing with remaining steps."
 }
 
+# ---------------------------------------------------------------------------
+# Default document: portal.htm at the top of the list, server level.
+# Uses the WebAdministration cmdlet path, not the raw API used elsewhere in
+# this script. CONFIRMED IN TESTING: manipulating this collection via the raw
+# Microsoft.Web.Administration API (GetCollection/Remove/AddAt) wiped out the
+# entire existing default document list, leaving only portal.htm - the raw
+# collection read apparently doesn't reliably reflect IIS's actual effective
+# list the way Get-WebConfiguration does. This rebuilds the list from the
+# EFFECTIVE (correctly resolved) existing entries instead, so nothing is lost.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Placing '$DefaultDocumentName' at the top of the default document list (server level)" -ForegroundColor Cyan
+try {
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', "Set default document to $DefaultDocumentName")) {
+        Import-Module WebAdministration -ErrorAction Stop
+
+        Set-WebConfigurationProperty -Filter 'system.webServer/defaultDocument' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
+
+        # Capture the EFFECTIVE current list first, before touching anything.
+        $existingDocs = @(Get-WebConfiguration -Filter 'system.webServer/defaultDocument/files/add' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue | ForEach-Object { $_.value })
+        Write-Host "  Existing effective list: $($existingDocs -join ', ')" -ForegroundColor DarkGray
+
+        Clear-WebConfiguration -Filter 'system.webServer/defaultDocument/files' -PSPath 'MACHINE/WEBROOT/APPHOST'
+        Add-WebConfiguration -Filter 'system.webServer/defaultDocument/files' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{value = $DefaultDocumentName }
+        foreach ($doc in $existingDocs) {
+            if ($doc -ne $DefaultDocumentName) {
+                Add-WebConfiguration -Filter 'system.webServer/defaultDocument/files' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{value = $doc }
+            }
+        }
+
+        $newList = @(Get-WebConfiguration -Filter 'system.webServer/defaultDocument/files/add' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue | ForEach-Object { $_.value })
+        Write-Host "  New list: $($newList -join ', ')" -ForegroundColor Green
+    }
+}
+catch {
+    Write-Warning "Default document step FAILED: $($_.Exception.Message). Continuing with remaining steps."
+}
+
+# ---------------------------------------------------------------------------
+# .NET Authorization Rule: Deny Anonymous Users, server level.
+# Uses the WebAdministration cmdlet path with an EXPLICIT MACHINE/WEBROOT/APPHOST
+# PSPath (the same proven-correct pattern as the FRT rule above). CONFIRMED IN
+# TESTING: the raw API's GetSection(path, '') for this system.web section did
+# NOT correctly target the true server root - the rule ended up on a site
+# instead. Additive: existing rules are left alone, checked first to avoid
+# adding a duplicate.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Adding .NET Authorization Rule: Deny Anonymous Users (server level)" -ForegroundColor Cyan
+try {
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Add deny rule for anonymous users')) {
+        Import-Module WebAdministration -ErrorAction Stop
+
+        $existingDenyAnon = Get-WebConfiguration -Filter "system.web/authorization/deny[@users='?']" -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue
+        if (-not $existingDenyAnon) {
+            Add-WebConfiguration -Filter 'system.web/authorization/deny' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{users = '?' }
+            Write-Host "  Deny rule added at MACHINE/WEBROOT/APPHOST." -ForegroundColor Green
+        }
+        else {
+            Write-Host "  Deny rule for anonymous users already present at the server level - not duplicated." -ForegroundColor DarkGray
+        }
+
+        # Verify it actually landed at the server root, not somewhere else.
+        $verifyRule = Get-WebConfiguration -Filter "system.web/authorization/deny[@users='?']" -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue
+        if (-not $verifyRule) {
+            Write-Warning "Could not confirm the deny rule at MACHINE/WEBROOT/APPHOST after adding it - verify manually with IIS Manager or 'Get-WebConfiguration' before relying on it."
+        }
+    }
+}
+catch {
+    Write-Warning ".NET Authorization Rule step FAILED: $($_.Exception.Message). Continuing with remaining steps."
+}
+
 Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
 try {
     if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
@@ -562,7 +588,15 @@ try {
         $wmsvcAccount = (Get-CimInstance Win32_Service -Filter "Name='WMSVC'" -ErrorAction SilentlyContinue).StartName
         if ($wmsvcAccount) {
             Write-Host "  WMSVC runs as '$wmsvcAccount' - granting it Modify on $WmsvcLogDirectory" -ForegroundColor DarkGray
-            icacls $WmsvcLogDirectory /grant "${wmsvcAccount}:(OI)(CI)M" /T /C | Out-Null
+            try {
+                icacls $WmsvcLogDirectory /grant "${wmsvcAccount}:(OI)(CI)M" /T /C | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "icacls grant for '$wmsvcAccount' returned exit code $LASTEXITCODE - continuing anyway, but check permissions on $WmsvcLogDirectory manually if WMSVC logging doesn't work."
+                }
+            }
+            catch {
+                Write-Warning "icacls grant failed: $($_.Exception.Message) - continuing anyway, WMSVC startup is not dependent on this succeeding."
+            }
         }
 
         if (-not (Test-Path $wmsvcKeyPath)) {
@@ -651,14 +685,10 @@ try {
         $frtProviderNames = ((Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas/add" -PSPath "MACHINE/WEBROOT/APPHOST/$($site.Name)" -ErrorAction SilentlyContinue | ForEach-Object { $_.provider }) -join ', ')
 
         $defaultDocsTop3 = try {
-            $siteDefaultDocSection = $verifyConfig.GetSection($DefaultDocPath, $site.Name)
-            ($siteDefaultDocSection.GetCollection('files') | Select-Object -First 3 | ForEach-Object { $_.GetAttributeValue('value') }) -join ', '
+            (Get-WebConfiguration -Filter 'system.webServer/defaultDocument/files/add' -PSPath "MACHINE/WEBROOT/APPHOST/$($site.Name)" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty value) -join ', '
         } catch { 'N/A' }
 
-        $denyAnonPresent = try {
-            $siteNetAuthSection = $verifyConfig.GetSection($NetAuthPath, $site.Name)
-            [bool]($siteNetAuthSection.GetCollection() | Where-Object { $_.ElementTagName -eq 'deny' -and $_.GetAttributeValue('users') -eq '?' })
-        } catch { 'N/A' }
+        $denyAnonPresent = [bool](Get-WebConfiguration -Filter "system.web/authorization/deny[@users='?']" -PSPath "MACHINE/WEBROOT/APPHOST/$($site.Name)" -ErrorAction SilentlyContinue)
 
         [PSCustomObject]@{
             Site               = $site.Name
