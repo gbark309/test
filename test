@@ -270,7 +270,7 @@ $WinAuthPath = 'system.webServer/security/authentication/windowsAuthentication'
 $AnonPath    = 'system.webServer/security/authentication/anonymousAuthentication'
 $BasicPath   = 'system.webServer/security/authentication/basicAuthentication'
 $DigestPath  = 'system.webServer/security/authentication/digestAuthentication'
-$AspSessionPath = 'system.webServer/asp/session'
+$AspPath = 'system.webServer/asp'
 $aspSessionTimeout = '{0:00}:{1:00}:00' -f [Math]::Floor($AspSessionTimeoutMinutes / 60), ($AspSessionTimeoutMinutes % 60)
 
 $mgr = New-Object Microsoft.Web.Administration.ServerManager
@@ -306,7 +306,20 @@ try {
         }
 
         Write-Host "  Setting ASP session timeout to $AspSessionTimeoutMinutes minutes (server-level default)" -ForegroundColor DarkGray
-        $config.GetSection($AspSessionPath, '')['timeout'] = $aspSessionTimeout
+        try {
+            # "asp/session" is NOT itself a declared section - "asp" is the
+            # section (overrideModeDefault="Deny", i.e. server-level only,
+            # which matches what we want anyway); "session" is a child
+            # element within it. GetSection() only resolves actual declared
+            # sections, so we get "asp" then step into its child element.
+            $aspSection = $config.GetSection($AspPath, '')
+            $sessionElement = $aspSection.GetChildElement('session')
+            $sessionElement['timeout'] = $aspSessionTimeout
+        }
+        catch {
+            Write-Host "    ($AspPath not present - classic ASP (Web-ASP) role service is not installed, nothing to set)" -ForegroundColor DarkGray
+            Write-Warning "Classic ASP session timeout was requested but the Web-ASP role service isn't installed, so this setting has no effect. Install it with: Install-WindowsFeature Web-ASP"
+        }
     }
 
     # -----------------------------------------------------------------------
@@ -319,7 +332,7 @@ try {
     foreach ($siteName in $siteNames) {
         Write-Host "  $siteName" -ForegroundColor DarkGray
         if (-not $PSCmdlet.ShouldProcess($siteName, 'Clear site-level authentication overrides')) { continue }
-        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath, $AspSessionPath)) {
+        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath)) {
             try {
                 $config.GetSection($path, $siteName).RevertToParent()
             }
@@ -392,8 +405,12 @@ try {
     $verificationRows = foreach ($site in $verifyMgr.Sites) {
         $winAuthSection = $verifyConfig.GetSection($WinAuthPath, $site.Name)
         $anonSection    = $verifyConfig.GetSection($AnonPath, $site.Name)
-        $aspSection     = $verifyConfig.GetSection($AspSessionPath, $site.Name)
         $providerValues = @($winAuthSection.GetCollection('providers') | ForEach-Object { $_.GetAttributeValue('value') })
+
+        $aspTimeoutValue = try {
+            $aspSection = $verifyConfig.GetSection($AspPath, $site.Name)
+            $aspSection.GetChildElement('session')['timeout']
+        } catch { 'N/A (Web-ASP not installed)' }
 
         [PSCustomObject]@{
             Site               = $site.Name
@@ -401,7 +418,7 @@ try {
             UseKernelMode      = $winAuthSection['useKernelMode']
             Providers          = ($providerValues -join ', ')
             AnonymousEnabled   = $anonSection['enabled']
-            AspSessionTimeout  = $aspSection['timeout']
+            AspSessionTimeout  = $aspTimeoutValue
         }
     }
     $verificationRows | Format-Table -AutoSize
