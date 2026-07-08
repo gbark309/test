@@ -44,27 +44,35 @@
     6. Adds a Failed Request Tracing rule for All content (path="*") at the
        SERVER level (MACHINE/WEBROOT/APPHOST), covering all four trace
        providers (WWW Server, ASP, ISAPI Extension, ASPNET) at Verbose, with
-       a status code range of 403-999 - inherited by every site the same way
-       authentication is.
+       a status code range of 403-999.
+       NOTE: unlike authentication, per-site overrides for this section are
+       NOT cleared (not in the per-site loop below). A site with its own
+       pre-existing traceFailedRequests rule will keep using that instead of
+       inheriting this one - this mainly matters on servers with sites that
+       already had FRT configured before this script ran.
     7. Ensures -DefaultDocumentName (portal.htm by default) is in the default
        document list and moves it to the TOP (first document IIS looks for),
-       at the SERVER level, clearing any per-site override the same way as
-       the other settings above.
+       at the SERVER level.
+       CONFIRMED IN TESTING: clearing the per-site override for this section
+       (calling RevertToParent() the same way as the authentication sections
+       above) breaks applicationHost.config in a way that prevents WAS/W3SVC
+       from starting - the write itself doesn't error, but the resulting
+       config fails validation at service startup. Per-site overrides for
+       this section are therefore deliberately NOT cleared. This means a
+       site with its own explicit defaultDocument override will keep using
+       that instead of inheriting this setting - check any such sites
+       manually if this needs to apply there too.
     8. Adds a .NET Authorization Rule (system.web/authorization) denying
        anonymous users (<deny users="?"/>) at the SERVER level. This is
        ADDITIVE, not clear-then-set: existing allow/deny rules (server-level
        or per-site) are left in place; only ensures this specific deny rule
        is present, checking first so re-running doesn't duplicate it.
-       CONFIRMED IN TESTING: unlike the system.webServer sections used
-       elsewhere in this script, calling RevertToParent() on this
-       system.web section at a site location breaks applicationHost.config
-       in a way that prevents WAS/W3SVC from starting - the write itself
-       doesn't error, but the resulting config fails validation at service
-       startup. Per-site overrides for this section are therefore
-       deliberately NOT cleared. This means a site with its own explicit
-       system.web/authorization override will keep using that instead of
-       inheriting this rule - check any such sites manually if this rule
-       needs to apply there too.
+       Per-site overrides for this section are also NOT cleared, as a
+       conservative precaution given the defaultDocument finding above -
+       this hasn't been specifically confirmed as a problem for this
+       section, but system.web sections have shown different behavior than
+       system.webServer sections in this script, so the safer default is to
+       leave per-site authorization rules untouched here too.
     9. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
@@ -393,6 +401,11 @@ try {
         }
 
         Write-Host "  Placing '$DefaultDocumentName' at the top of the default document list (server-level default)" -ForegroundColor DarkGray
+        # NOTE: per-site override is deliberately NOT cleared for this
+        # section (no RevertToParent() call in the loop below) - confirmed
+        # in testing that clearing it breaks applicationHost.config in a way
+        # that prevents WAS/W3SVC from starting, even though the write
+        # itself doesn't throw an error. See script header.
         $defaultDocSection = $config.GetSection($DefaultDocPath, '')
         $defaultDocSection['enabled'] = $true
         $filesCollection = $defaultDocSection.GetCollection('files')
@@ -407,12 +420,11 @@ try {
             # system.web/authorization ("?" denotes anonymous/unauthenticated
             # users in ASP.NET's authorization syntax). Additive at the
             # server level only (existing rules left in place, checked first
-            # to avoid duplicates). Per-site overrides are deliberately NOT
-            # cleared here - confirmed in testing that RevertToParent() on
-            # this system.web section (unlike the system.webServer sections
-            # used elsewhere in this script) breaks applicationHost.config
-            # in a way that prevents WAS/W3SVC from starting, even though
-            # the write itself doesn't throw an error. See script header.
+            # to avoid duplicates). Per-site overrides are NOT cleared here -
+            # this hasn't specifically been confirmed as a problem (the
+            # confirmed WAS-startup issue was the defaultDocument section
+            # above), but as a conservative precaution given that finding,
+            # this section is also left server-level-only for now.
             $netAuthSection = $config.GetSection($NetAuthPath, '')
             $netAuthCollection = $netAuthSection.GetCollection()
             $existingDenyAnon = $netAuthCollection | Where-Object {
@@ -442,7 +454,7 @@ try {
     foreach ($siteName in $siteNames) {
         Write-Host "  $siteName" -ForegroundColor DarkGray
         if (-not $PSCmdlet.ShouldProcess($siteName, 'Clear site-level authentication overrides')) { continue }
-        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath, $DefaultDocPath)) {
+        foreach ($path in @($WinAuthPath, $AnonPath, $BasicPath, $DigestPath)) {
             try {
                 $config.GetSection($path, $siteName).RevertToParent()
             }
@@ -469,11 +481,6 @@ finally {
 }
 
 # ---------------------------------------------------------------------------
-# Management Service (WMSVC) - separate mechanism (registry + service),
-# unrelated to applicationHost.config, so no interaction with the batched
-# session above.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Log event destination: Both Log File and ETW Event.
 # Uses the WebAdministration cmdlet (not the raw batched session above) -
 # logFile.logTargetW3C is a [Flags] enum in the strongly-typed API, not a
@@ -482,21 +489,26 @@ finally {
 # so the extra disk I/O from using the cmdlet here is negligible.
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Setting log event destination to File + ETW" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('Log event destination', 'Set to File,ETW')) {
-    Import-Module WebAdministration -ErrorAction Stop
+try {
+    if ($PSCmdlet.ShouldProcess('Log event destination', 'Set to File,ETW')) {
+        Import-Module WebAdministration -ErrorAction Stop
 
-    Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'logTargetW3C' -Value 'File,ETW'
-    Write-Host "  siteDefaults set (applies to any site created later)" -ForegroundColor DarkGray
+        Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'logTargetW3C' -Value 'File,ETW'
+        Write-Host "  siteDefaults set (applies to any site created later)" -ForegroundColor DarkGray
 
-    foreach ($siteName in $siteNames) {
-        try {
-            Set-WebConfigurationProperty -Filter "system.applicationHost/sites/site[@name='$siteName']/logFile" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'logTargetW3C' -Value 'File,ETW' -ErrorAction Stop
-            Write-Host "  $siteName : File,ETW" -ForegroundColor DarkGray
-        }
-        catch {
-            Write-Warning "Could not set log event destination for site '$siteName': $($_.Exception.Message)"
+        foreach ($siteName in $siteNames) {
+            try {
+                Set-WebConfigurationProperty -Filter "system.applicationHost/sites/site[@name='$siteName']/logFile" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'logTargetW3C' -Value 'File,ETW' -ErrorAction Stop
+                Write-Host "  $siteName : File,ETW" -ForegroundColor DarkGray
+            }
+            catch {
+                Write-Warning "Could not set log event destination for site '$siteName': $($_.Exception.Message)"
+            }
         }
     }
+}
+catch {
+    Write-Warning "Log event destination step FAILED: $($_.Exception.Message). Continuing with remaining steps."
 }
 
 # ---------------------------------------------------------------------------
@@ -511,57 +523,85 @@ if ($PSCmdlet.ShouldProcess('Log event destination', 'Set to File,ETW')) {
 # given the type-mismatch issues already hit twice in this script.
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Adding Failed Request Tracing rule: All content (*) - server level" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Add FRT rule: All content')) {
-    Set-WebConfigurationProperty -Filter 'system.webServer/tracing/traceFailedRequestsLogging' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
+try {
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Add FRT rule: All content')) {
+        Set-WebConfigurationProperty -Filter 'system.webServer/tracing/traceFailedRequestsLogging' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
 
-    Clear-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue
-    Add-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{path = '*' }
-    Set-WebConfigurationProperty -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/failureDefinitions" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'statusCodes' -Value '403-999'
+        Clear-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue
+        Add-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{path = '*' }
+        Set-WebConfigurationProperty -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/failureDefinitions" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'statusCodes' -Value '403-999'
 
-    # Four FRT trace providers per Microsoft's traceProviderDefinitions schema.
-    # ASP and ISAPI Extension have no sub-areas of their own.
-    $frtProviders = @(
-        @{ Provider = 'WWW Server';     Areas = 'Authentication,Security,Filter,StaticFile,CGI,Compression,Cache,RequestNotifications,Module,FastCGI,WebSocket' }
-        @{ Provider = 'ASP';             Areas = $null }
-        @{ Provider = 'ISAPI Extension'; Areas = $null }
-        @{ Provider = 'ASPNET';          Areas = 'Infrastructure,Module,Page,AppServices' }
-    )
-    foreach ($p in $frtProviders) {
-        $value = @{ provider = $p.Provider; verbosity = 'Verbose' }
-        if ($p.Areas) { $value['areas'] = $p.Areas }
-        Add-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas" -PSPath 'MACHINE/WEBROOT/APPHOST' -Value $value
+        # Four FRT trace providers per Microsoft's traceProviderDefinitions schema.
+        # ASP and ISAPI Extension have no sub-areas of their own.
+        $frtProviders = @(
+            @{ Provider = 'WWW Server';     Areas = 'Authentication,Security,Filter,StaticFile,CGI,Compression,Cache,RequestNotifications,Module,FastCGI,WebSocket' }
+            @{ Provider = 'ASP';             Areas = $null }
+            @{ Provider = 'ISAPI Extension'; Areas = $null }
+            @{ Provider = 'ASPNET';          Areas = 'Infrastructure,Module,Page,AppServices' }
+        )
+        foreach ($p in $frtProviders) {
+            $value = @{ provider = $p.Provider; verbosity = 'Verbose' }
+            if ($p.Areas) { $value['areas'] = $p.Areas }
+            Add-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas" -PSPath 'MACHINE/WEBROOT/APPHOST' -Value $value
+        }
+        Write-Host "  Rule added: path=* covering WWW Server, ASP, ISAPI Extension, ASPNET at Verbose, status codes 403-999" -ForegroundColor DarkGray
     }
-    Write-Host "  Rule added: path=* covering WWW Server, ASP, ISAPI Extension, ASPNET at Verbose, status codes 403-999" -ForegroundColor DarkGray
+}
+catch {
+    Write-Warning "Failed Request Tracing rule step FAILED: $($_.Exception.Message). Continuing with remaining steps."
 }
 
 Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
-    New-Item -ItemType Directory -Path $WmsvcLogDirectory -Force | Out-Null
+try {
+    if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
+        New-Item -ItemType Directory -Path $WmsvcLogDirectory -Force | Out-Null
 
-    # WMSVC does not always run as SYSTEM - grant whichever account it's
-    # actually configured for explicit access to the new log folder, since
-    # inherited permissions on E:\Logs may not cover that account.
-    $wmsvcAccount = (Get-CimInstance Win32_Service -Filter "Name='WMSVC'" -ErrorAction SilentlyContinue).StartName
-    if ($wmsvcAccount) {
-        Write-Host "  WMSVC runs as '$wmsvcAccount' - granting it Modify on $WmsvcLogDirectory" -ForegroundColor DarkGray
-        icacls $WmsvcLogDirectory /grant "${wmsvcAccount}:(OI)(CI)M" /T /C | Out-Null
-    }
+        # WMSVC does not always run as SYSTEM - grant whichever account it's
+        # actually configured for explicit access to the new log folder, since
+        # inherited permissions on E:\Logs may not cover that account.
+        $wmsvcAccount = (Get-CimInstance Win32_Service -Filter "Name='WMSVC'" -ErrorAction SilentlyContinue).StartName
+        if ($wmsvcAccount) {
+            Write-Host "  WMSVC runs as '$wmsvcAccount' - granting it Modify on $WmsvcLogDirectory" -ForegroundColor DarkGray
+            icacls $WmsvcLogDirectory /grant "${wmsvcAccount}:(OI)(CI)M" /T /C | Out-Null
+        }
 
-    if (-not (Test-Path $wmsvcKeyPath)) {
-        New-Item -Path $wmsvcKeyPath -Force | Out-Null
-    }
-    Set-ItemProperty -Path $wmsvcKeyPath -Name 'EnableRemoteManagement' -Value 1 -Type DWord
-    Set-ItemProperty -Path $wmsvcKeyPath -Name 'LoggingDirectory' -Value $WmsvcLogDirectory -Type String
+        if (-not (Test-Path $wmsvcKeyPath)) {
+            New-Item -Path $wmsvcKeyPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $wmsvcKeyPath -Name 'EnableRemoteManagement' -Value 1 -Type DWord
+        Set-ItemProperty -Path $wmsvcKeyPath -Name 'LoggingDirectory' -Value $WmsvcLogDirectory -Type String
 
-    $wmsvcService = Get-Service -Name WMSVC -ErrorAction SilentlyContinue
-    if (-not $wmsvcService) {
-        Write-Warning "WMSVC service not found - is the 'Management Service' (Web-Mgmt-Service) role service installed?"
+        $wmsvcService = Get-Service -Name WMSVC -ErrorAction SilentlyContinue
+        if (-not $wmsvcService) {
+            Write-Warning "WMSVC service not found - is the 'Management Service' (Web-Mgmt-Service) role service installed?"
+        }
+        else {
+            Set-Service -Name WMSVC -StartupType Automatic
+            Write-Host "  WMSVC StartupType set to Automatic." -ForegroundColor DarkGray
+
+            if ((Get-Service -Name WMSVC).Status -ne 'Running') {
+                Start-Service -Name WMSVC
+                # Give it a moment to actually transition state rather than
+                # trusting Start-Service's return alone - confirm it stuck.
+                $waited = 0
+                while ((Get-Service -Name WMSVC).Status -ne 'Running' -and $waited -lt 10) {
+                    Start-Sleep -Seconds 1
+                    $waited++
+                }
+            }
+
+            $wmsvcStatus = (Get-Service -Name WMSVC).Status
+            if ($wmsvcStatus -eq 'Running') {
+                Write-Host "  WMSVC is Running. Logging to $WmsvcLogDirectory" -ForegroundColor Green
+            }
+            else {
+                Write-Warning "WMSVC StartupType is Automatic but the service did not reach Running state (currently: $wmsvcStatus). Check Event Viewer (System log) for the WMSVC/WAS startup error."
+            }
+        }
     }
-    else {
-        Set-Service -Name WMSVC -StartupType Automatic
-        Start-Service -Name WMSVC
-        Write-Host "  WMSVC set to Automatic and started. Logging to $WmsvcLogDirectory" -ForegroundColor Green
-    }
+}
+catch {
+    Write-Warning "WMSVC configuration step FAILED: $($_.Exception.Message). Continuing with remaining steps."
 }
 
 # ---------------------------------------------------------------------------
@@ -571,14 +611,19 @@ if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
 # applicationHost.config session above.
 # ---------------------------------------------------------------------------
 Write-Host "`n==> Setting HTTP.sys parameters (MaxFieldLength / MaxRequestBytes)" -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess($httpKeyPath, 'Set MaxFieldLength / MaxRequestBytes')) {
-    if (-not (Test-Path $httpKeyPath)) {
-        New-Item -Path $httpKeyPath -Force | Out-Null
+try {
+    if ($PSCmdlet.ShouldProcess($httpKeyPath, 'Set MaxFieldLength / MaxRequestBytes')) {
+        if (-not (Test-Path $httpKeyPath)) {
+            New-Item -Path $httpKeyPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $httpKeyPath -Name 'MaxFieldLength' -Value 0xfffe -Type DWord
+        Set-ItemProperty -Path $httpKeyPath -Name 'MaxRequestBytes' -Value 0xfffe -Type DWord
+        Write-Host "  MaxFieldLength and MaxRequestBytes set to 0xfffe (65534)." -ForegroundColor Green
+        Write-Warning "HTTP.sys is a kernel-mode driver - these values only take effect after a full server RESTART, not just an IIS/service restart. Reboot when convenient to apply them."
     }
-    Set-ItemProperty -Path $httpKeyPath -Name 'MaxFieldLength' -Value 0xfffe -Type DWord
-    Set-ItemProperty -Path $httpKeyPath -Name 'MaxRequestBytes' -Value 0xfffe -Type DWord
-    Write-Host "  MaxFieldLength and MaxRequestBytes set to 0xfffe (65534)." -ForegroundColor Green
-    Write-Warning "HTTP.sys is a kernel-mode driver - these values only take effect after a full server RESTART, not just an IIS/service restart. Reboot when convenient to apply them."
+}
+catch {
+    Write-Warning "HTTP.sys parameters step FAILED: $($_.Exception.Message). Continuing with remaining steps."
 }
 
 # ---------------------------------------------------------------------------
