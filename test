@@ -6,7 +6,8 @@
     sets the classic ASP session timeout to 15 minutes server-wide, sets the
     log event destination to Both Log File and ETW Event, adds a server-level
     Failed Request Tracing rule for All content, places portal.htm at the top
-    of the default document list server-wide, enables + starts the
+    of the default document list server-wide, adds a server-level .NET
+    Authorization Rule denying anonymous users, enables + starts the
     Management Service (WMSVC) with its logging redirected to E:\Logs\WMSVC,
     and sets the HTTP.sys MaxFieldLength/MaxRequestBytes registry parameters.
 
@@ -49,13 +50,20 @@
        document list and moves it to the TOP (first document IIS looks for),
        at the SERVER level, clearing any per-site override the same way as
        the other settings above.
-    8. Enables Management Service remote management, redirects its logging
+    8. Adds a .NET Authorization Rule (system.web/authorization) denying
+       anonymous users (<deny users="?"/>) at the SERVER level. Unlike the
+       other settings above, this is ADDITIVE, not clear-then-set: existing
+       site-specific authorization rules are left alone, since those may be
+       load-bearing for an app's own access control (e.g. role-based rules)
+       and stripping them could silently break something. Checks for an
+       existing identical rule first so re-running doesn't duplicate it.
+    9. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
-    9. Sets HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters
-       MaxFieldLength and MaxRequestBytes to 0xfffe (65534), server-wide.
-       HTTP.sys is a kernel-mode driver, so these only take effect after a
-       full server restart, not just an IIS/service restart.
+    10. Sets HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters
+        MaxFieldLength and MaxRequestBytes to 0xfffe (65534), server-wide.
+        HTTP.sys is a kernel-mode driver, so these only take effect after a
+        full server restart, not just an IIS/service restart.
 
     Because the auth settings are set once at the server level with no
     site-level overrides left in place, any site created AFTER this script
@@ -325,6 +333,7 @@ $BasicPath   = 'system.webServer/security/authentication/basicAuthentication'
 $DigestPath  = 'system.webServer/security/authentication/digestAuthentication'
 $AspPath = 'system.webServer/asp'
 $DefaultDocPath = 'system.webServer/defaultDocument'
+$NetAuthPath = 'system.web/authorization'
 $aspSessionTimeout = [TimeSpan]::FromMinutes($AspSessionTimeoutMinutes)
 
 $mgr = New-Object Microsoft.Web.Administration.ServerManager
@@ -384,6 +393,32 @@ try {
         $newDocElement = $filesCollection.CreateElement('add')
         $newDocElement.SetAttributeValue('value', $DefaultDocumentName)
         $filesCollection.AddAt(0, $newDocElement)
+
+        Write-Host "  Adding .NET Authorization Rule: Deny Anonymous Users (server-level default)" -ForegroundColor DarkGray
+        try {
+            # system.web/authorization ("? " denotes anonymous/unauthenticated
+            # users in ASP.NET's authorization syntax). This is additive, not
+            # a clear-then-set like the other settings above - existing
+            # allow/deny rules (server-level or per-site) are left in place;
+            # we only ensure this specific deny rule is present, checking
+            # first so re-running the script doesn't add a duplicate.
+            $netAuthSection = $config.GetSection($NetAuthPath, '')
+            $netAuthCollection = $netAuthSection.GetCollection()
+            $existingDenyAnon = $netAuthCollection | Where-Object {
+                $_.ElementTagName -eq 'deny' -and $_.GetAttributeValue('users') -eq '?'
+            }
+            if (-not $existingDenyAnon) {
+                $newDenyElement = $netAuthCollection.CreateElement('deny')
+                $newDenyElement.SetAttributeValue('users', '?')
+                $netAuthCollection.Add($newDenyElement) | Out-Null
+            }
+            else {
+                Write-Host "    (deny rule for anonymous users already present - not duplicated)" -ForegroundColor DarkGray
+            }
+        }
+        catch {
+            Write-Host "    ($NetAuthPath not present - nothing to set) - $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
     }
 
     # -----------------------------------------------------------------------
@@ -564,6 +599,11 @@ try {
             ($siteDefaultDocSection.GetCollection('files') | Select-Object -First 3 | ForEach-Object { $_.GetAttributeValue('value') }) -join ', '
         } catch { 'N/A' }
 
+        $denyAnonPresent = try {
+            $siteNetAuthSection = $verifyConfig.GetSection($NetAuthPath, $site.Name)
+            [bool]($siteNetAuthSection.GetCollection() | Where-Object { $_.ElementTagName -eq 'deny' -and $_.GetAttributeValue('users') -eq '?' })
+        } catch { 'N/A' }
+
         [PSCustomObject]@{
             Site               = $site.Name
             WindowsAuthEnabled = $winAuthSection['enabled']
@@ -575,6 +615,7 @@ try {
             FrtRulePath        = $frtRulePath
             FrtProviders       = $frtProviderNames
             DefaultDocsTop3    = $defaultDocsTop3
+            DenyAnonymousUsers = $denyAnonPresent
         }
     }
     $verificationRows | Format-Table -AutoSize
