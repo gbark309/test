@@ -3,9 +3,10 @@
     Sets Windows Authentication (Negotiate:Kerberos only, kernel-mode off) as
     the SERVER-LEVEL default in IIS, so every site - existing and future -
     inherits it automatically, disables all other authentication methods,
-    sets the classic ASP session timeout to 15 minutes server-wide, and
-    enables + starts the Management Service (WMSVC) with its logging
-    redirected to E:\Logs\WMSVC.
+    sets the classic ASP session timeout to 15 minutes server-wide, sets the
+    log event destination to Both Log File and ETW Event, and enables +
+    starts the Management Service (WMSVC) with its logging redirected to
+    E:\Logs\WMSVC.
 
 .DESCRIPTION
     Rather than looping through each site and setting an explicit override
@@ -35,7 +36,9 @@
        overrides the same way authentication is handled, so it's genuinely
        inherited everywhere rather than silently blocked by an existing
        per-site value.
-    5. Enables Management Service remote management, redirects its logging
+    5. Sets the log event destination to Both Log File and ETW Event
+       (logFile.logTargetW3C = "File,ETW"), at siteDefaults and per-site.
+    6. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
 
@@ -363,7 +366,33 @@ finally {
 # unrelated to applicationHost.config, so no interaction with the batched
 # session above.
 # ---------------------------------------------------------------------------
-Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+# Log event destination: Both Log File and ETW Event.
+# Uses the WebAdministration cmdlet (not the raw batched session above) -
+# logFile.logTargetW3C is a [Flags] enum in the strongly-typed API, not a
+# string, so it carries the same type-mismatch risk we just hit with the ASP
+# session timeout. This is only 1 property per site (not 4 x N like auth),
+# so the extra disk I/O from using the cmdlet here is negligible.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Setting log event destination to File + ETW" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('Log event destination', 'Set to File,ETW')) {
+    Import-Module WebAdministration -ErrorAction Stop
+
+    Set-WebConfigurationProperty -Filter 'system.applicationHost/sites/siteDefaults/logFile' -PSPath 'IIS:\' -Name 'logTargetW3C' -Value 'File,ETW'
+    Write-Host "  siteDefaults set (applies to any site created later)" -ForegroundColor DarkGray
+
+    foreach ($siteName in $siteNames) {
+        try {
+            Set-ItemProperty -Path "IIS:\Sites\$siteName" -Name 'logFile.logTargetW3C' -Value 'File,ETW' -ErrorAction Stop
+            Write-Host "  $siteName : File,ETW" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Warning "Could not set log event destination for site '$siteName': $($_.Exception.Message)"
+        }
+    }
+}
+
+
 if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
     New-Item -ItemType Directory -Path $WmsvcLogDirectory -Force | Out-Null
 
@@ -412,6 +441,8 @@ try {
             $aspSection.GetChildElement('session')['timeout']
         } catch { 'N/A (Web-ASP not installed)' }
 
+        $logTargetValue = (Get-ItemProperty -Path "IIS:\Sites\$($site.Name)" -Name logFile.logTargetW3C -ErrorAction SilentlyContinue).Value
+
         [PSCustomObject]@{
             Site               = $site.Name
             WindowsAuthEnabled = $winAuthSection['enabled']
@@ -419,6 +450,7 @@ try {
             Providers          = ($providerValues -join ', ')
             AnonymousEnabled   = $anonSection['enabled']
             AspSessionTimeout  = $aspTimeoutValue
+            LogTarget          = $logTargetValue
         }
     }
     $verificationRows | Format-Table -AutoSize
