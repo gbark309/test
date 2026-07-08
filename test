@@ -4,9 +4,9 @@
     the SERVER-LEVEL default in IIS, so every site - existing and future -
     inherits it automatically, disables all other authentication methods,
     sets the classic ASP session timeout to 15 minutes server-wide, sets the
-    log event destination to Both Log File and ETW Event, and enables +
-    starts the Management Service (WMSVC) with its logging redirected to
-    E:\Logs\WMSVC.
+    log event destination to Both Log File and ETW Event, adds a server-level
+    Failed Request Tracing rule for All content, and enables + starts the
+    Management Service (WMSVC) with its logging redirected to E:\Logs\WMSVC.
 
 .DESCRIPTION
     Rather than looping through each site and setting an explicit override
@@ -38,7 +38,12 @@
        per-site value.
     5. Sets the log event destination to Both Log File and ETW Event
        (logFile.logTargetW3C = "File,ETW"), at siteDefaults and per-site.
-    6. Enables Management Service remote management, redirects its logging
+    6. Adds a Failed Request Tracing rule for All content (path="*") at the
+       SERVER level (MACHINE/WEBROOT/APPHOST), covering all four trace
+       providers (WWW Server, ASP, ISAPI Extension, ASPNET) at Verbose, with
+       a status code range of 100-999 - inherited by every site the same way
+       authentication is.
+    7. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
 
@@ -392,7 +397,42 @@ if ($PSCmdlet.ShouldProcess('Log event destination', 'Set to File,ETW')) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Failed Request Tracing rule: All content (*), set at the SERVER level
+# (MACHINE/WEBROOT/APPHOST). system.webServer/tracing supports the same
+# location-based inheritance as the authentication sections, so a rule set
+# here cascades to every site (present and future) unless a site defines its
+# own override. Uses the WebAdministration cmdlet path (proven syntax from
+# the original per-site implementation, just repointed at the server root) -
+# the rule's nested structure (section -> collection -> element -> nested
+# collection) has more moving parts than is worth risking on the raw API
+# given the type-mismatch issues already hit twice in this script.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Adding Failed Request Tracing rule: All content (*) - server level" -ForegroundColor Cyan
+if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Add FRT rule: All content')) {
+    Set-WebConfigurationProperty -Filter 'system.webServer/tracing/traceFailedRequestsLogging' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true
 
+    Clear-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue
+    Add-WebConfiguration -Filter 'system.webServer/tracing/traceFailedRequests' -PSPath 'MACHINE/WEBROOT/APPHOST' -Value @{path = '*' }
+    Set-WebConfigurationProperty -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/failureDefinitions" -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'statusCodes' -Value '100-999'
+
+    # Four FRT trace providers per Microsoft's traceProviderDefinitions schema.
+    # ASP and ISAPI Extension have no sub-areas of their own.
+    $frtProviders = @(
+        @{ Provider = 'WWW Server';     Areas = 'Authentication,Security,Filter,StaticFile,CGI,Compression,Cache,RequestNotifications,Module,FastCGI,WebSocket' }
+        @{ Provider = 'ASP';             Areas = $null }
+        @{ Provider = 'ISAPI Extension'; Areas = $null }
+        @{ Provider = 'ASPNET';          Areas = 'Infrastructure,Module,Page,AppServices' }
+    )
+    foreach ($p in $frtProviders) {
+        $value = @{ provider = $p.Provider; verbosity = 'Verbose' }
+        if ($p.Areas) { $value['areas'] = $p.Areas }
+        Add-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas" -PSPath 'MACHINE/WEBROOT/APPHOST' -Value $value
+    }
+    Write-Host "  Rule added: path=* covering WWW Server, ASP, ISAPI Extension, ASPNET at Verbose, status codes 100-999" -ForegroundColor DarkGray
+}
+
+Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
 if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
     New-Item -ItemType Directory -Path $WmsvcLogDirectory -Force | Out-Null
 
@@ -443,6 +483,9 @@ try {
 
         $logTargetValue = (Get-ItemProperty -Path "IIS:\Sites\$($site.Name)" -Name logFile.logTargetW3C -ErrorAction SilentlyContinue).Value
 
+        $frtRulePath = (Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add" -PSPath "IIS:\Sites\$($site.Name)" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty path)
+        $frtProviderNames = ((Get-WebConfiguration -Filter "system.webServer/tracing/traceFailedRequests/add[@path='*']/traceAreas/add" -PSPath "IIS:\Sites\$($site.Name)" -ErrorAction SilentlyContinue | ForEach-Object { $_.provider }) -join ', ')
+
         [PSCustomObject]@{
             Site               = $site.Name
             WindowsAuthEnabled = $winAuthSection['enabled']
@@ -451,6 +494,8 @@ try {
             AnonymousEnabled   = $anonSection['enabled']
             AspSessionTimeout  = $aspTimeoutValue
             LogTarget          = $logTargetValue
+            FrtRulePath        = $frtRulePath
+            FrtProviders       = $frtProviderNames
         }
     }
     $verificationRows | Format-Table -AutoSize
