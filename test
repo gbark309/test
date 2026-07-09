@@ -76,6 +76,12 @@
         "Binding") allowing TCP on -FirewallPorts (default 447, 5443) on the
         Domain profile. Idempotent - skipped if a rule with that name
         already exists.
+    12. Copies portal.htm from -PortalHtmSource to -PortalHtmDestination on
+        this host. Setting portal.htm as the default document (step 7) only
+        tells IIS what filename to look for - the file must actually exist
+        in wwwroot for it to serve anything. Any existing destination file
+        is backed up first so -Revert can restore its exact original
+        content, not just delete the copied one.
 
     Because the auth settings are set once at the server level with no
     site-level overrides left in place, any site created AFTER this script
@@ -84,9 +90,10 @@
 .PARAMETER Revert
     Restores applicationHost.config from the backup taken by a previous run
     of this script, and restores the WMSVC/HTTP.sys registry values, WMSVC
-    service state, ONWS_ENVIRONMENT, and the firewall rule to what they were
-    before that run - undoing everything above. Use -Timestamp to pick a
-    specific prior run; otherwise the most recent backup is used.
+    service state, ONWS_ENVIRONMENT, the firewall rule, and portal.htm to
+    what they were before that run - undoing everything above. Use
+    -Timestamp to pick a specific prior run; otherwise the most recent
+    backup is used.
 
 .PARAMETER Timestamp
     Used with -Revert to pick a specific backup (format: yyyyMMdd_HHmmss).
@@ -105,6 +112,16 @@
 
 .PARAMETER FirewallPorts
     TCP ports to allow inbound on the Domain profile. Default: 447, 5443
+
+.PARAMETER PortalHtmSource
+    UNC or local path to copy portal.htm from. Default: \\networksource\portal.htm
+    - this is a PLACEHOLDER; update it to your actual network path (or pass
+    -PortalHtmSource explicitly each run) before relying on this default.
+
+.PARAMETER PortalHtmDestination
+    Where to copy portal.htm to on this host. Default:
+    D:\inetpub\wwwroot\portal.htm (matches the wwwroot location set up by
+    Move-Inetpub-Logs.ps1 earlier in this build).
 
 .PARAMETER Environment
     Required when applying (not needed for -Revert/-ListBackups). PROD or
@@ -134,6 +151,8 @@ param(
     [int]$AspSessionTimeoutMinutes = 15,
     [string]$FirewallRuleName = 'Binding',
     [int[]]$FirewallPorts = @(447, 5443),
+    [string]$PortalHtmSource = '\\networksource\portal.htm',
+    [string]$PortalHtmDestination = 'D:\inetpub\wwwroot\portal.htm',
 
     [ValidateSet('PROD', 'DEV')]
     [string]$Environment
@@ -321,6 +340,34 @@ if ($Revert) {
                     Write-Host "  '$fwRuleName' already existed before this run - left in place." -ForegroundColor DarkGray
                 }
             }
+
+            # Restore portal.htm state (if this state file has it - older
+            # backups won't).
+            if ($state.PSObject.Properties.Name -contains 'PortalHtmDestExisted') {
+                Write-Host "`n==> Restoring portal.htm" -ForegroundColor Cyan
+                $portalDest = if ($state.PSObject.Properties.Name -contains 'PortalHtmDestination') { $state.PortalHtmDestination } else { $PortalHtmDestination }
+
+                if (-not $state.PortalHtmDestExisted) {
+                    if (Test-Path $portalDest) {
+                        if ($PSCmdlet.ShouldProcess($portalDest, 'Remove (did not exist before this run)')) {
+                            Remove-Item -Path $portalDest -Force -ErrorAction SilentlyContinue
+                        }
+                        Write-Host "  Removed $portalDest (did not exist before this run)." -ForegroundColor Green
+                    }
+                    else {
+                        Write-Host "  $portalDest already absent - nothing to do." -ForegroundColor DarkGray
+                    }
+                }
+                elseif ($state.PortalHtmBackupPath -and (Test-Path $state.PortalHtmBackupPath)) {
+                    if ($PSCmdlet.ShouldProcess($portalDest, "Restore from $($state.PortalHtmBackupPath)")) {
+                        Copy-Item -Path $state.PortalHtmBackupPath -Destination $portalDest -Force
+                    }
+                    Write-Host "  Restored $portalDest from $($state.PortalHtmBackupPath)." -ForegroundColor Green
+                }
+                else {
+                    Write-Warning "portal.htm existed before this run but no backup copy was found - cannot restore its original content automatically. Check $BackupFolder for a portal.htm.bak_* file."
+                }
+            }
         }
         else {
             Write-Host "  (no WMSVC state file for this backup - nothing to restore there)" -ForegroundColor DarkGray
@@ -379,10 +426,19 @@ $preState = [PSCustomObject]@{
     OnwsEnvironmentPrior  = [Environment]::GetEnvironmentVariable('ONWS_ENVIRONMENT', 'Machine')
     FirewallRuleName      = $FirewallRuleName
     FirewallRuleExisted   = [bool](Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue)
+    PortalHtmDestExisted  = Test-Path $PortalHtmDestination
+    PortalHtmDestination  = $PortalHtmDestination
+    PortalHtmBackupPath   = $null
+}
+if ($preState.PortalHtmDestExisted) {
+    $portalHtmBackup = Join-Path $BackupFolder "portal.htm.bak_$RunTimestamp"
+    Copy-Item -Path $PortalHtmDestination -Destination $portalHtmBackup -Force
+    $preState.PortalHtmBackupPath = $portalHtmBackup
+    Write-Host "  Existing $PortalHtmDestination backed up to $portalHtmBackup" -ForegroundColor DarkGray
 }
 $StateFilePath = Join-Path $BackupFolder "Set-IIS-WindowsAuthentication_state_$RunTimestamp.json"
 $preState | ConvertTo-Json | Set-Content -Path $StateFilePath -Encoding UTF8
-Write-Host "  WMSVC/HTTP.sys/ONWS_ENVIRONMENT pre-change state saved to $StateFilePath" -ForegroundColor DarkGray
+Write-Host "  WMSVC/HTTP.sys/ONWS_ENVIRONMENT/portal.htm pre-change state saved to $StateFilePath" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------------------
 # ONWS_ENVIRONMENT machine-scope environment variable.
@@ -627,6 +683,30 @@ catch {
     Write-Warning "Default document step FAILED: $($_.Exception.Message). Continuing with remaining steps."
 }
 
+# ---------------------------------------------------------------------------
+# Copy portal.htm from the network source to wwwroot on this host. Setting
+# portal.htm as the default document (above) only tells IIS what filename to
+# look for - it doesn't mean the file exists. Any existing destination file
+# was already backed up during state capture, so -Revert can restore it.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Copying portal.htm from $PortalHtmSource to $PortalHtmDestination" -ForegroundColor Cyan
+try {
+    if ($PSCmdlet.ShouldProcess($PortalHtmDestination, "Copy from $PortalHtmSource")) {
+        if (-not (Test-Path $PortalHtmSource)) {
+            throw "Source not found or not reachable: $PortalHtmSource"
+        }
+        $destFolder = Split-Path -Path $PortalHtmDestination -Parent
+        if (-not (Test-Path $destFolder)) {
+            throw "Destination folder does not exist: $destFolder"
+        }
+        Copy-Item -Path $PortalHtmSource -Destination $PortalHtmDestination -Force
+        Write-Host "  Copied successfully." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Warning "portal.htm copy step FAILED: $($_.Exception.Message). Continuing with remaining steps."
+}
+
 Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
 try {
     if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
@@ -789,6 +869,14 @@ Write-Host "(New processes will see this value; this PowerShell session and anyt
 Write-Host "`nFirewall rule '$FirewallRuleName':" -ForegroundColor Yellow
 Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue | Select-Object DisplayName, Direction, Action, Enabled, Profile
 Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue | Get-NetFirewallPortFilter | Select-Object Protocol, LocalPort
+
+Write-Host "`nportal.htm:" -ForegroundColor Yellow
+if (Test-Path $PortalHtmDestination) {
+    Get-Item $PortalHtmDestination | Select-Object FullName, Length, LastWriteTime
+}
+else {
+    Write-Warning "$PortalHtmDestination does not exist - the copy step may have failed. Check the warnings above."
+}
 
 Write-Host "Backup saved to $BackupConfigPath - revert with:" -ForegroundColor DarkGray
 Write-Host "  .\$($MyInvocation.MyCommand.Name) -Revert -Timestamp $RunTimestamp" -ForegroundColor DarkGray
