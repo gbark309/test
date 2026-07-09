@@ -5,27 +5,21 @@
     inherits it automatically, disables all other authentication methods,
     sets the classic ASP session timeout to 15 minutes server-wide, sets the
     log event destination to Both Log File and ETW Event, adds a server-level
-    Failed Request Tracing rule for All content, enables + starts the
+    Failed Request Tracing rule for All content, adds a server-level .NET
+    Authorization Rule denying anonymous users, places portal.htm at the top
+    of the default document list server-wide, enables + starts the
     Management Service (WMSVC) with its logging redirected to E:\Logs\WMSVC,
-    sets the HTTP.sys MaxFieldLength/MaxRequestBytes registry parameters, and
-    sets a machine-wide ONWS_ENVIRONMENT environment variable to PROD or DEV.
-
-    NOTE: the default document (portal.htm) and .NET Authorization Rules
-    (deny anonymous users) settings were removed from this script after
-    repeated, inconsistent failures via both the raw Microsoft.Web.Administration
-    API and the WebAdministration cmdlets (data loss, wrong scope, and silent
-    no-ops in different attempts). Configure those two manually via IIS
-    Manager instead: server node > Default Document (add/reorder portal.htm),
-    and server node > .NET Authorization Rules (Add Deny Rule > anonymous
-    users) - these are Microsoft's own tested code paths for these settings.
+    sets the HTTP.sys MaxFieldLength/MaxRequestBytes registry parameters,
+    sets a machine-wide ONWS_ENVIRONMENT environment variable to PROD or DEV,
+    and creates a firewall inbound rule allowing the specified TCP ports.
 
 .DESCRIPTION
     Rather than looping through each site and setting an explicit override
     (which a new site created later would NOT inherit), this script:
 
     1. Backs up applicationHost.config, and snapshots the pre-change
-       WMSVC/HTTP.sys registry/service state (needed for -Revert, since
-       those aren't part of applicationHost.config).
+       WMSVC/HTTP.sys/ONWS_ENVIRONMENT/firewall state (needed for -Revert,
+       since those aren't part of applicationHost.config).
     2. Sets the SERVER-LEVEL default FIRST (MACHINE/WEBROOT/APPHOST, no
        location):
          - windowsAuthentication: enabled = true
@@ -48,7 +42,10 @@
        inherited everywhere rather than silently blocked by an existing
        per-site value.
     5. Sets the log event destination to Both Log File and ETW Event
-       (logFile.logTargetW3C = "File,ETW"), at siteDefaults and per-site.
+       (logFile.logTargetW3C = "File,ETW"), at siteDefaults and per-site, via
+       appcmd.exe (the WebAdministration cmdlet path failed intermittently
+       here with a null-reference error - appcmd has no dependency on that
+       module/provider stack and has proven reliable).
     6. Adds a Failed Request Tracing rule for All content (path="*") at the
        SERVER level (MACHINE/WEBROOT/APPHOST), covering all four trace
        providers (WWW Server, ASP, ISAPI Extension, ASPNET) at Verbose, with
@@ -58,19 +55,27 @@
        pre-existing traceFailedRequests rule will keep using that instead of
        inheriting this one - this mainly matters on servers with sites that
        already had FRT configured before this script ran.
-    7. Enables Management Service remote management, redirects its logging
+    7. Adds a .NET Authorization Rule (system.web/authorization) denying
+       anonymous users, and places portal.htm at the top of the default
+       document list, both at the server level - covered by the standard
+       applicationHost.config backup/-Revert, no separate state tracking.
+    8. Enables Management Service remote management, redirects its logging
        to -WmsvcLogDirectory, grants that folder's actual service account
        access to it, sets the service to Automatic, and starts it.
-    8. Sets HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters
+    9. Sets HKLM:\SYSTEM\CurrentControlSet\Services\HTTP\Parameters
        MaxFieldLength and MaxRequestBytes to 0xfffe (65534), server-wide.
        HTTP.sys is a kernel-mode driver, so these only take effect after a
        full server restart, not just an IIS/service restart.
-    9. Sets the machine-wide (not process/user-scope) environment variable
-       ONWS_ENVIRONMENT to -Environment (PROD or DEV). Machine scope so it's
-       visible to every process on the server, including ones started after
-       this script runs - not just the current session. Existing running
-       processes, including the PowerShell session that ran this script,
-       won't see the new value until they restart.
+    10. Sets the machine-wide (not process/user-scope) environment variable
+        ONWS_ENVIRONMENT to -Environment (PROD or DEV). Machine scope so it's
+        visible to every process on the server, including ones started after
+        this script runs - not just the current session. Existing running
+        processes, including the PowerShell session that ran this script,
+        won't see the new value until they restart.
+    11. Creates an inbound firewall rule (-FirewallRuleName, default
+        "Binding") allowing TCP on -FirewallPorts (default 447, 5443) on the
+        Domain profile. Idempotent - skipped if a rule with that name
+        already exists.
 
     Because the auth settings are set once at the server level with no
     site-level overrides left in place, any site created AFTER this script
@@ -78,10 +83,10 @@
 
 .PARAMETER Revert
     Restores applicationHost.config from the backup taken by a previous run
-    of this script, and restores the WMSVC and HTTP.sys registry values and
-    WMSVC service state to what they were before that run - undoing
-    everything above. Use -Timestamp to pick a specific prior run;
-    otherwise the most recent backup is used.
+    of this script, and restores the WMSVC/HTTP.sys registry values, WMSVC
+    service state, ONWS_ENVIRONMENT, and the firewall rule to what they were
+    before that run - undoing everything above. Use -Timestamp to pick a
+    specific prior run; otherwise the most recent backup is used.
 
 .PARAMETER Timestamp
     Used with -Revert to pick a specific backup (format: yyyyMMdd_HHmmss).
@@ -94,6 +99,12 @@
 
 .PARAMETER AspSessionTimeoutMinutes
     Classic ASP session timeout, in minutes, set server-wide. Default: 15
+
+.PARAMETER FirewallRuleName
+    Display name (and name) for the inbound firewall rule. Default: Binding
+
+.PARAMETER FirewallPorts
+    TCP ports to allow inbound on the Domain profile. Default: 447, 5443
 
 .PARAMETER Environment
     Required when applying (not needed for -Revert/-ListBackups). PROD or
@@ -121,6 +132,8 @@ param(
     [string]$BackupFolder = 'C:\Config-Backups',
     [string]$WmsvcLogDirectory = 'E:\Logs\WMSVC',
     [int]$AspSessionTimeoutMinutes = 15,
+    [string]$FirewallRuleName = 'Binding',
+    [int[]]$FirewallPorts = @(447, 5443),
 
     [ValidateSet('PROD', 'DEV')]
     [string]$Environment
@@ -287,6 +300,27 @@ if ($Revert) {
                     Write-Host "  Restored to '$($state.OnwsEnvironmentPrior)'." -ForegroundColor Green
                 }
             }
+
+            # Restore firewall rule state (if this state file has it - older
+            # backups won't).
+            if ($state.PSObject.Properties.Name -contains 'FirewallRuleExisted') {
+                Write-Host "`n==> Restoring firewall rule state" -ForegroundColor Cyan
+                $fwRuleName = if ($state.PSObject.Properties.Name -contains 'FirewallRuleName') { $state.FirewallRuleName } else { $FirewallRuleName }
+                if (-not $state.FirewallRuleExisted) {
+                    if (Get-NetFirewallRule -DisplayName $fwRuleName -ErrorAction SilentlyContinue) {
+                        if ($PSCmdlet.ShouldProcess($fwRuleName, 'Remove firewall rule (did not exist before this run)')) {
+                            Remove-NetFirewallRule -DisplayName $fwRuleName -ErrorAction SilentlyContinue
+                        }
+                        Write-Host "  Removed '$fwRuleName' (did not exist before this run)." -ForegroundColor Green
+                    }
+                    else {
+                        Write-Host "  '$fwRuleName' already absent - nothing to do." -ForegroundColor DarkGray
+                    }
+                }
+                else {
+                    Write-Host "  '$fwRuleName' already existed before this run - left in place." -ForegroundColor DarkGray
+                }
+            }
         }
         else {
             Write-Host "  (no WMSVC state file for this backup - nothing to restore there)" -ForegroundColor DarkGray
@@ -343,6 +377,8 @@ $preState = [PSCustomObject]@{
     HttpMaxFieldLength    = if (Test-Path $httpKeyPath) { (Get-ItemProperty -Path $httpKeyPath -Name MaxFieldLength -ErrorAction SilentlyContinue).MaxFieldLength } else { $null }
     HttpMaxRequestBytes   = if (Test-Path $httpKeyPath) { (Get-ItemProperty -Path $httpKeyPath -Name MaxRequestBytes -ErrorAction SilentlyContinue).MaxRequestBytes } else { $null }
     OnwsEnvironmentPrior  = [Environment]::GetEnvironmentVariable('ONWS_ENVIRONMENT', 'Machine')
+    FirewallRuleName      = $FirewallRuleName
+    FirewallRuleExisted   = [bool](Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue)
 }
 $StateFilePath = Join-Path $BackupFolder "Set-IIS-WindowsAuthentication_state_$RunTimestamp.json"
 $preState | ConvertTo-Json | Set-Content -Path $StateFilePath -Encoding UTF8
@@ -550,6 +586,47 @@ try {
 catch {
     Write-Warning "Failed Request Tracing rule step FAILED: $($_.Exception.Message). Continuing with remaining steps."
 }
+
+# ---------------------------------------------------------------------------
+# .NET Authorization Rule: Deny Anonymous Users, server level.
+# Covered by the standard applicationHost.config backup/-Revert already
+# taken at the start of this run - no separate state tracking needed.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Adding .NET Authorization Rule: Deny Anonymous Users (server level)" -ForegroundColor Cyan
+try {
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT', 'Deny anonymous users (.NET Authorization)')) {
+        Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT' -Filter "system.web/authorization" -Name "." -Value @{ users = '?' } -Type 'deny'
+        Write-Host "  Deny rule added at MACHINE/WEBROOT." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Warning ".NET Authorization Rule step FAILED: $($_.Exception.Message). Continuing with remaining steps."
+}
+
+# ---------------------------------------------------------------------------
+# Default document: portal.htm at the top of the list, server level.
+# Covered by the standard applicationHost.config backup/-Revert already
+# taken at the start of this run - no separate state tracking needed.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Placing portal.htm at the top of the default document list (server level)" -ForegroundColor Cyan
+try {
+    if ($PSCmdlet.ShouldProcess('MACHINE/WEBROOT/APPHOST', 'Set default document to portal.htm')) {
+        Import-Module WebAdministration -ErrorAction Stop
+
+        # Remove any inherited or existing 'portal.htm' to avoid duplicate-key errors
+        Remove-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter '/system.webServer/defaultDocument/files' -Name 'Collection' -AtElement @{ value = 'portal.htm' } -ErrorAction SilentlyContinue
+
+        # Add 'portal.htm' as the first default document (server-wide)
+        Add-WebConfiguration -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter '/system.webServer/defaultDocument/files' -AtIndex 0 -Value @{ value = 'portal.htm' }
+
+        $newList = @(Get-WebConfiguration -Filter 'system.webServer/defaultDocument/files/add' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction SilentlyContinue | ForEach-Object { $_.value })
+        Write-Host "  Current list: $($newList -join ', ')" -ForegroundColor Green
+    }
+}
+catch {
+    Write-Warning "Default document step FAILED: $($_.Exception.Message). Continuing with remaining steps."
+}
+
 Write-Host "`n==> Configuring Management Service (WMSVC)" -ForegroundColor Cyan
 try {
     if ($PSCmdlet.ShouldProcess('WMSVC', 'Enable, redirect logging, start')) {
@@ -634,6 +711,27 @@ catch {
 }
 
 # ---------------------------------------------------------------------------
+# Firewall inbound rule: allow TCP 447, 5443 (Domain profile).
+# Idempotent - skips creation if a rule with this display name already
+# exists, rather than erroring on a duplicate.
+# ---------------------------------------------------------------------------
+Write-Host "`n==> Creating firewall inbound rule '$FirewallRuleName' (TCP $($FirewallPorts -join ', '))" -ForegroundColor Cyan
+try {
+    if ($PSCmdlet.ShouldProcess($FirewallRuleName, "Allow inbound TCP $($FirewallPorts -join ', ') (Domain profile)")) {
+        if (Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue) {
+            Write-Host "  Rule '$FirewallRuleName' already exists - not duplicated." -ForegroundColor DarkGray
+        }
+        else {
+            New-NetFirewallRule -DisplayName $FirewallRuleName -Name $FirewallRuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $FirewallPorts -Profile Domain -Enabled True | Out-Null
+            Write-Host "  Rule '$FirewallRuleName' created." -ForegroundColor Green
+        }
+    }
+}
+catch {
+    Write-Warning "Firewall rule step FAILED: $($_.Exception.Message). Continuing with remaining steps."
+}
+
+# ---------------------------------------------------------------------------
 # Verification - fresh read (new session) of the EFFECTIVE (inherited) value
 # per site, confirming they're picking up the server default rather than a
 # stale local override. Reads are cheap - no batching concerns here.
@@ -687,6 +785,10 @@ Write-Host "(A server restart is required for these to take effect if this is th
 Write-Host "`nONWS_ENVIRONMENT:" -ForegroundColor Yellow
 Write-Host "  $([Environment]::GetEnvironmentVariable('ONWS_ENVIRONMENT', 'Machine'))"
 Write-Host "(New processes will see this value; this PowerShell session and anything already running won't until restarted.)" -ForegroundColor DarkGray
+
+Write-Host "`nFirewall rule '$FirewallRuleName':" -ForegroundColor Yellow
+Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue | Select-Object DisplayName, Direction, Action, Enabled, Profile
+Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue | Get-NetFirewallPortFilter | Select-Object Protocol, LocalPort
 
 Write-Host "Backup saved to $BackupConfigPath - revert with:" -ForegroundColor DarkGray
 Write-Host "  .\$($MyInvocation.MyCommand.Name) -Revert -Timestamp $RunTimestamp" -ForegroundColor DarkGray
